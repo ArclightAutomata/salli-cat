@@ -333,7 +333,7 @@ def add_manual_to_database(manual: dict) -> int | None:
             doc_type = dt
             break
 
-    return database.add_manual(
+    manual_id = database.add_manual(
         brand=brand,
         model=title,
         manual_url=manual["url"],
@@ -342,6 +342,15 @@ def add_manual_to_database(manual: dict) -> int | None:
         category=manual.get("category", ""),
         doc_type=doc_type,
     )
+
+    # Check if already on archive.org
+    if manual_id and manual.get("id"):
+        is_archived, archive_url = check_archive_org(manual["id"])
+        if is_archived:
+            logger.info(f"Already on archive.org: {title}")
+            database.update_archived(manual_id, archive_url)
+
+    return manual_id
 
 
 def wait_for_recaptcha_solved(page: Page, timeout: int = CAPTCHA_TIMEOUT) -> bool:
@@ -564,20 +573,17 @@ def scrape_manualsbase(
     """Main scraping function for manualsbase."""
 
     # Step 1: Get all brands
+    brands = scrape_all_brands(page)
+
     if specific_brands:
-        # Use specific brands instead of scraping all
-        brands = []
-        for brand_url in specific_brands:
-            match = re.search(r'/brand/details/(\d+)/([^/]+)/', brand_url)
-            if match:
-                brands.append({
-                    "name": match.group(2).replace("-", " ").title(),
-                    "url": brand_url if brand_url.startswith("http") else BASE_URL + brand_url,
-                    "id": match.group(1),
-                    "slug": match.group(2),
-                })
-    else:
-        brands = scrape_all_brands(page)
+        # Filter to only matching brand names (case-insensitive)
+        specific_brands_lower = [b.lower() for b in specific_brands]
+        filtered_brands = [b for b in brands if b["name"].lower() in specific_brands_lower]
+        if not filtered_brands:
+            logger.warning(f"No brands found matching: {specific_brands}")
+        else:
+            logger.info(f"Filtered to {len(filtered_brands)} brands: {[b['name'] for b in filtered_brands]}")
+        brands = filtered_brands
 
     if limit_brands:
         brands = brands[:limit_brands]
@@ -654,7 +660,7 @@ def main():
     parser.add_argument("--index-only", action="store_true", help="Only build index, don't download")
     parser.add_argument("--download-only", action="store_true", help="Only download pending manuals")
     parser.add_argument("--limit-brands", type=int, help="Limit number of brands to process")
-    parser.add_argument("--brands", nargs="*", help="Specific brand URLs to scrape")
+    parser.add_argument("--brands", nargs="*", help="Specific brand names to scrape (e.g., jvc sony)")
     parser.add_argument("--clear", action="store_true", help="Clear all manualsbase records from database")
     args = parser.parse_args()
 
