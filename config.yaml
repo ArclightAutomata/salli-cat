@@ -38,6 +38,7 @@ manualslib:
   use_proxy: true
   # browser: firefox
   # stealth: false
+  headless: true
 
 # ManualsBase settings
 manualsbase:
@@ -51,6 +52,7 @@ manualsbase:
     - remote
   # Override global settings for this scraper:
   use_proxy: false
+  headless: true
 
 # Manualzz settings
 manualzz:
