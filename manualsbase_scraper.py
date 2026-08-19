@@ -767,7 +767,7 @@ def main():
             context.close()
 
     stats = database.get_stats(source="manualsbase")
-    logger.info(f"ManualsBase scraping complete. Total: {stats['total']}, Downloaded: {stats['downloaded']}, Pending: {stats['pending']}")
+    logger.info(f"ManualsBase scraping complete. Total: {stats['total']}, Downloaded: {stats['downloaded']}, Archived: {stats['archived']}, Pending: {stats['pending']}, Pending archive: {stats['pending_archive']}")
 
 
 if __name__ == "__main__":

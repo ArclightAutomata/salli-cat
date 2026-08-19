@@ -390,8 +390,13 @@ def get_brand_stats() -> dict:
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) as total FROM brands")
+    # Count distinct brands from manuals table (all sources)
+    cursor.execute("SELECT COUNT(DISTINCT brand) as total FROM manuals")
     total = cursor.fetchone()["total"]
+
+    # Count from brands table (ManualsLib discovery workflow)
+    cursor.execute("SELECT COUNT(*) as total FROM brands")
+    brands_table_total = cursor.fetchone()["total"]
 
     cursor.execute("SELECT COUNT(*) as scraped FROM brands WHERE scraped = 1")
     scraped = cursor.fetchone()["scraped"]
@@ -401,7 +406,7 @@ def get_brand_stats() -> dict:
     return {
         "total": total,
         "scraped": scraped,
-        "pending": total - scraped
+        "pending": brands_table_total - scraped if brands_table_total > 0 else 0
     }
 
 
@@ -656,11 +661,18 @@ def get_stats(source: str = None) -> dict:
     cursor.execute(f"SELECT COUNT(*) as archived FROM manuals WHERE archived = 1{' AND source = ?' if source else ''}", params)
     archived = cursor.fetchone()["archived"]
 
+    cursor.execute(f"SELECT COUNT(*) as pending FROM manuals WHERE downloaded = 0 AND archived = 0{' AND source = ?' if source else ''}", params)
+    pending = cursor.fetchone()["pending"]
+
+    cursor.execute(f"SELECT COUNT(*) as pending_archive FROM manuals WHERE downloaded = 1 AND archived = 0{' AND source = ?' if source else ''}", params)
+    pending_archive = cursor.fetchone()["pending_archive"]
+
     by_brand_query = """
         SELECT brand,
                COUNT(*) as total,
                SUM(CASE WHEN downloaded = 1 THEN 1 ELSE 0 END) as downloaded,
-               SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived
+               SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived,
+               SUM(CASE WHEN downloaded = 0 AND archived = 0 THEN 1 ELSE 0 END) as pending
         FROM manuals
     """
     if source:
@@ -675,7 +687,9 @@ def get_stats(source: str = None) -> dict:
         SELECT COALESCE(source, 'manualslib') as source,
                COUNT(*) as total,
                SUM(CASE WHEN downloaded = 1 THEN 1 ELSE 0 END) as downloaded,
-               SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived
+               SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived,
+               SUM(CASE WHEN downloaded = 0 AND archived = 0 THEN 1 ELSE 0 END) as pending,
+               SUM(CASE WHEN downloaded = 1 AND archived = 0 THEN 1 ELSE 0 END) as pending_archive
         FROM manuals
         GROUP BY source
         ORDER BY source
@@ -688,7 +702,8 @@ def get_stats(source: str = None) -> dict:
         "total": total,
         "downloaded": downloaded,
         "archived": archived,
-        "pending": total - downloaded - archived,
+        "pending": pending,
+        "pending_archive": pending_archive,
         "by_brand": by_brand,
         "by_source": by_source,
     }

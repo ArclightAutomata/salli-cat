@@ -742,7 +742,7 @@ def scrape_manualzz(catalog_urls: list[str], download_dir: Path, download: bool 
             context.close()
 
     stats = database.get_stats(source="manualzz")
-    logger.info(f"Manualzz scraping complete. Total: {stats['total']}, Downloaded: {stats['downloaded']}, Pending: {stats['pending']}")
+    logger.info(f"Manualzz scraping complete. Total: {stats['total']}, Downloaded: {stats['downloaded']}, Archived: {stats['archived']}, Pending: {stats['pending']}, Pending archive: {stats['pending_archive']}")
 
 
 def main():

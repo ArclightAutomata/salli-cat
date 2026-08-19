@@ -365,17 +365,16 @@
 
             // Source breakdown
             const sourceRowsHtml = (stats.by_source || []).map(s => {
-                const pending = s.total - s.downloaded - s.archived;
                 return `
                     <div class="source-row">
                         <span class="source-name">
                             <span class="source-badge ${s.source}">${s.source}</span>
                         </span>
                         <div class="source-counts">
-                            <span>Total: <span class="num">${s.total}</span></span>
+                            <span>Indexed: <span class="num">${s.total}</span></span>
                             <span>Downloaded: <span class="num" style="color:#22c55e">${s.downloaded}</span></span>
                             <span>Archived: <span class="num" style="color:#3b82f6">${s.archived}</span></span>
-                            <span>Pending: <span class="num" style="color:#f59e0b">${pending}</span></span>
+                            <span>Pending: <span class="num" style="color:#f59e0b">${s.pending}</span></span>
                         </div>
                     </div>
                 `;
@@ -383,7 +382,7 @@
             document.getElementById('source-rows').innerHTML = sourceRowsHtml || '<p>No data yet</p>';
 
             const barsHtml = stats.by_brand.map(b => {
-                const done = b.downloaded + b.archived;
+                const done = b.total - b.pending;
                 const pct = b.total > 0 ? (done / b.total * 100) : 0;
                 return `
                     <div class="brand-bar">
