@@ -3,7 +3,9 @@
 
 import logging
 import os
+import secrets
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,15 +18,69 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+PROXY_SESSION_PLACEHOLDER = "{session}"
+
+
+def new_proxy_session_id() -> str:
+    """Generate a random session ID for proxy providers with session-based IP rotation."""
+    return secrets.token_hex(6)
+
+
+def proxy_supports_rotation() -> bool:
+    """
+    True if the proxy config contains a {session} placeholder, meaning a browser
+    relaunch will get a fresh session ID and therefore a new exit IP.
+    """
+    return (
+        PROXY_SESSION_PLACEHOLDER in os.environ.get("PROXY_URL", "")
+        or PROXY_SESSION_PLACEHOLDER in os.environ.get("PROXY_USER", "")
+    )
+
+
+def resolve_proxy_user(user: str) -> str:
+    """
+    Substitute the {session} placeholder in a proxy username with a fresh
+    random session ID. Providers assign a new exit IP per session ID, e.g.:
+      Decodo:      user-USERNAME-session-{session}      (gate.decodo.com:7000)
+      Oxylabs:     customer-USERNAME-sessid-{session}
+      Bright Data: brd-customer-ID-zone-ZONE-session-{session}
+    """
+    if PROXY_SESSION_PLACEHOLDER in user:
+        session_id = new_proxy_session_id()
+        user = user.replace(PROXY_SESSION_PLACEHOLDER, session_id)
+        logger.info(f"Using proxy session: {session_id}")
+    return user
+
+
 def get_proxy_config() -> dict | None:
     """
     Get proxy config from environment variables.
 
-    Works with any HTTP proxy (Oxylabs, Bright Data, etc.)
-    Set PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS in .env
+    Works with any HTTP proxy (Decodo, Oxylabs, Bright Data, etc.)
+    Set PROXY_URL (e.g. http://user:pass@host:port) in .env, or the individual
+    PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS variables. PROXY_URL takes
+    precedence over the individual variables.
+
+    A {session} placeholder in the username is replaced with a fresh random
+    session ID on every call, so each browser launch gets a new exit IP.
 
     Returns a proxy dict for Playwright, or None if not configured.
     """
+    proxy_url = os.environ.get("PROXY_URL")
+    if proxy_url:
+        parsed = urllib.parse.urlsplit(proxy_url)
+        if not parsed.hostname:
+            logger.warning("PROXY_URL is set but has no hostname - ignoring it")
+        else:
+            server = f"{parsed.scheme or 'http'}://{parsed.hostname}"
+            if parsed.port:
+                server += f":{parsed.port}"
+            config = {"server": server}
+            if parsed.username:
+                config["username"] = resolve_proxy_user(urllib.parse.unquote(parsed.username))
+                config["password"] = urllib.parse.unquote(parsed.password or "")
+            return config
+
     host = os.environ.get("PROXY_HOST")
     port = os.environ.get("PROXY_PORT")
     user = os.environ.get("PROXY_USER")
@@ -33,7 +89,7 @@ def get_proxy_config() -> dict | None:
     if host and port and user and password:
         return {
             "server": f"http://{host}:{port}",
-            "username": user,
+            "username": resolve_proxy_user(user),
             "password": password,
         }
 
