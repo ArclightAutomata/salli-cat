@@ -22,7 +22,7 @@ from pdf_utils import strip_manualslib_watermark
 load_dotenv()
 
 import database
-from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving
+from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user
 from captcha_solver import TwoCaptchaSolver, extract_sitekey_from_page, inject_captcha_response
 
 logging.basicConfig(
@@ -35,11 +35,57 @@ BASE_URL = "https://www.manualslib.com"
 
 # Circuit breaker settings
 MAX_CONSECUTIVE_FAILURES = 3
+# With proxy rotation, every failed download retries on a fresh exit IP, so an
+# IP ban self-heals; allow more attempts before concluding the site is down
+MAX_CONSECUTIVE_ROTATION_FAILURES = 5
 
 
 class DownloadCircuitBreakerError(Exception):
     """Raised when too many consecutive download failures occur."""
     pass
+
+
+class DownloadFailureTracker:
+    """
+    Tracks consecutive download failures and decides between rotating the
+    proxy IP and tripping the circuit breaker.
+
+    With rotation available, each failure rotates to a fresh exit IP and the
+    breaker only trips after MAX_CONSECUTIVE_ROTATION_FAILURES consecutive
+    failures (each already on a different IP). Without rotation, it trips
+    after MAX_CONSECUTIVE_FAILURES.
+    """
+
+    def __init__(self, rotate_page=None):
+        self.rotate_page = rotate_page
+        self.consecutive_failures = 0
+        self.max_failures = MAX_CONSECUTIVE_ROTATION_FAILURES if rotate_page else MAX_CONSECUTIVE_FAILURES
+
+    def success(self):
+        self.consecutive_failures = 0
+
+    def failure(self, page: Page) -> Page:
+        """
+        Record one failed download. Raises DownloadCircuitBreakerError at the
+        limit; otherwise rotates the proxy IP (when available) and returns the
+        page to use for the next attempt.
+        """
+        self.consecutive_failures += 1
+        logger.warning(f"Download failed ({self.consecutive_failures}/{self.max_failures} consecutive failures)")
+        if self.consecutive_failures >= self.max_failures:
+            if self.rotate_page:
+                raise DownloadCircuitBreakerError(
+                    f"Stopping after {self.max_failures} consecutive download failures, "
+                    "each retried on a freshly rotated proxy IP. "
+                    "This likely indicates a site issue rather than an IP ban."
+                )
+            raise DownloadCircuitBreakerError(
+                f"Stopping after {self.max_failures} consecutive download failures. "
+                "This may indicate an IP ban or site issue."
+            )
+        if self.rotate_page:
+            return self.rotate_page()
+        return page
 
 
 class DownloadLimitReached(Exception):
@@ -502,14 +548,30 @@ def wait_for_captcha_solved(page: Page, timeout: int = CAPTCHA_TIMEOUT, captcha_
 
 
 def get_proxy_url() -> str | None:
-    """Get proxy URL from environment variables (for urllib requests)."""
+    """
+    Get proxy URL from environment variables (for urllib requests).
+
+    PROXY_URL takes precedence over the individual PROXY_* variables.
+    A {session} placeholder in the username is replaced with a fresh session ID.
+    """
+    proxy_url = os.environ.get("PROXY_URL")
+    if proxy_url:
+        parsed = urllib.parse.urlsplit(proxy_url)
+        if parsed.username:
+            user = resolve_proxy_user(urllib.parse.unquote(parsed.username))
+            password = urllib.parse.unquote(parsed.password or "")
+            host_port = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+            return f"{parsed.scheme or 'http'}://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{host_port}"
+        return proxy_url
+
     host = os.environ.get("PROXY_HOST")
     port = os.environ.get("PROXY_PORT")
     user = os.environ.get("PROXY_USER")
     password = os.environ.get("PROXY_PASS")
 
     if host and port and user and password:
-        return f"http://{user}:{password}@{host}:{port}"
+        user = resolve_proxy_user(user)
+        return f"http://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{host}:{port}"
     return None
 
 
@@ -741,7 +803,7 @@ def download_manual(page: Page, manual: dict, download_dir: Path, brand: str, ca
         return str(final_path), original_sha1, original_md5, original_file_size, original_filename, None, None, None, None
 
 
-def scrape_brand(page: Page, brand: str, download_dir: Path, download: bool = True, category_urls: list[str] = None, categories: list[str] = None, captcha_solver: TwoCaptchaSolver = None):
+def scrape_brand(page: Page, brand: str, download_dir: Path, download: bool = True, category_urls: list[str] = None, categories: list[str] = None, captcha_solver: TwoCaptchaSolver = None, rotate_page=None):
     """Scrape all CRT manuals for a brand.
 
     Args:
@@ -752,6 +814,10 @@ def scrape_brand(page: Page, brand: str, download_dir: Path, download: bool = Tr
         category_urls: List of full category URLs to scrape (from discovered brands)
         categories: List of category slugs like ['tv', 'tv-dvd-combo'] to build URLs from
         captcha_solver: Optional 2captcha solver for automatic captcha solving
+        rotate_page: Optional callable that relaunches the browser with a fresh
+                     proxy session (new exit IP) and returns the new page. Called
+                     after each download failure so the circuit breaker only trips
+                     if multiple different IPs fail.
     """
     logger.info(f"Starting scrape for brand: {brand}")
 
@@ -784,7 +850,7 @@ def scrape_brand(page: Page, brand: str, download_dir: Path, download: bool = Tr
     pending = database.get_undownloaded_manuals(brand)
     logger.info(f"Found {len(pending)} manuals to download for {brand}")
 
-    consecutive_failures = 0
+    failures = DownloadFailureTracker(rotate_page)
 
     for manual_record in pending:
         try:
@@ -821,27 +887,16 @@ def scrape_brand(page: Page, brand: str, download_dir: Path, download: bool = Tr
                     manual_record["id"], file_path, sha1, md5, file_size, original_filename,
                     original_sha1, original_md5, original_file_path, original_file_size
                 )
-                consecutive_failures = 0  # Reset on success
+                failures.success()
                 increment_download_count()
             else:
-                consecutive_failures += 1
-                logger.warning(f"Download failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES} consecutive failures)")
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    raise DownloadCircuitBreakerError(
-                        f"Stopping after {MAX_CONSECUTIVE_FAILURES} consecutive download failures. "
-                        "This may indicate an IP ban or site issue."
-                    )
+                page = failures.failure(page)
             random_delay()
         except (DownloadCircuitBreakerError, DownloadLimitReached):
             raise  # Re-raise to stop
         except Exception as e:
             logger.error(f"Error downloading {manual_record['model']}: {e}")
-            consecutive_failures += 1
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                raise DownloadCircuitBreakerError(
-                    f"Stopping after {MAX_CONSECUTIVE_FAILURES} consecutive download failures. "
-                    "This may indicate an IP ban or site issue."
-                )
+            page = failures.failure(page)
             continue
 
 
@@ -931,11 +986,23 @@ def main():
 
     # Log proxy configuration (proxy is only used for browser, not file downloads)
     if use_proxy:
-        host = os.environ.get("PROXY_HOST")
-        port = os.environ.get("PROXY_PORT")
+        proxy_url_env = os.environ.get("PROXY_URL")
+        if proxy_url_env:
+            parsed = urllib.parse.urlsplit(proxy_url_env)
+            host, port = parsed.hostname, parsed.port
+        else:
+            host = os.environ.get("PROXY_HOST")
+            port = os.environ.get("PROXY_PORT")
         if host and port:
             logger.info(f"Proxy configured for browser: {host}:{port}")
             logger.info("Note: File downloads use direct connection (no proxy) to save bandwidth")
+            if proxy_supports_rotation():
+                logger.info(
+                    "Proxy IP rotation enabled: browser will relaunch with a fresh session after each download failure "
+                    f"(circuit breaker trips after {MAX_CONSECUTIVE_ROTATION_FAILURES} consecutive failures instead of {MAX_CONSECUTIVE_FAILURES})"
+                )
+            else:
+                logger.info("Tip: add a {session} placeholder to the proxy username in .env to enable automatic IP rotation on download failures")
 
     if extension_path:
         logger.info(f"Using uBlock Origin extension: {extension_path}")
@@ -943,33 +1010,50 @@ def main():
         logger.info("No uBlock Origin extension found - will use route-based ad blocking")
 
     with sync_playwright() as p:
-        # Launch browser with extension support (requires persistent context)
-        context, extension_loaded = launch_browser_with_extension(
-            p,
-            extension_path=extension_path,
-            headless=headless,
-            browser=browser_type,
-            use_proxy=use_proxy,
-        )
+        def launch_and_setup():
+            # Launch browser with extension support (requires persistent context)
+            ctx, ext_loaded = launch_browser_with_extension(
+                p,
+                extension_path=extension_path,
+                headless=headless,
+                browser=browser_type,
+                use_proxy=use_proxy,
+            )
 
-        # Persistent context may already have pages open, use the first one or create new
-        if context.pages:
-            page = context.pages[0]
-        else:
-            page = context.new_page()
+            # Persistent context may already have pages open, use the first one or create new
+            if ctx.pages:
+                pg = ctx.pages[0]
+            else:
+                pg = ctx.new_page()
 
-        # Apply stealth patches to avoid fingerprint detection (if enabled)
-        if use_stealth:
-            apply_stealth(page)
+            # Apply stealth patches to avoid fingerprint detection (if enabled)
+            if use_stealth:
+                apply_stealth(pg)
 
-        # If no extension loaded, use route-based ad blocking as fallback
-        if not extension_loaded:
-            setup_route_ad_blocking(page)
-        else:
-            logger.info("uBlock Origin extension loaded for ad blocking")
+            # If no extension loaded, use route-based ad blocking as fallback
+            if not ext_loaded:
+                setup_route_ad_blocking(pg)
+            else:
+                logger.info("uBlock Origin extension loaded for ad blocking")
 
-        # Block bandwidth-heavy static content to save proxy costs
-        setup_bandwidth_saving(page)
+            # Block bandwidth-heavy static content to save proxy costs
+            setup_bandwidth_saving(pg)
+            return ctx, pg
+
+        context, page = launch_and_setup()
+
+        def rotate_browser():
+            """Relaunch the browser with a fresh proxy session to force a new exit IP."""
+            nonlocal context, page
+            logger.info("Rotating proxy IP: relaunching browser with a fresh session...")
+            try:
+                context.close()
+            except Exception as e:
+                logger.warning(f"Error closing browser during IP rotation: {e}")
+            context, page = launch_and_setup()
+            return page
+
+        rotate_page = rotate_browser if use_proxy and proxy_supports_rotation() else None
 
         try:
             # Brand discovery mode
@@ -1010,7 +1094,7 @@ def main():
 
             if args.download_only:
                 # Only download pending manuals
-                consecutive_failures = 0
+                failures = DownloadFailureTracker(rotate_page)
                 for brand in brands:
                     pending = database.get_undownloaded_manuals(brand)
                     logger.info(f"Downloading {len(pending)} pending manuals for {brand}")
@@ -1049,27 +1133,16 @@ def main():
                                     manual_record["id"], file_path, sha1, md5, file_size, original_filename,
                                     original_sha1, original_md5, original_file_path, original_file_size
                                 )
-                                consecutive_failures = 0  # Reset on success
+                                failures.success()
                                 increment_download_count()
                             else:
-                                consecutive_failures += 1
-                                logger.warning(f"Download failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES} consecutive failures)")
-                                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                                    raise DownloadCircuitBreakerError(
-                                        f"Stopping after {MAX_CONSECUTIVE_FAILURES} consecutive download failures. "
-                                        "This may indicate an IP ban or site issue."
-                                    )
+                                page = failures.failure(page)
                             random_delay()
                         except (DownloadCircuitBreakerError, DownloadLimitReached):
                             raise  # Re-raise to stop
                         except Exception as e:
                             logger.error(f"Error downloading {manual_record['model']}: {e}")
-                            consecutive_failures += 1
-                            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                                raise DownloadCircuitBreakerError(
-                                    f"Stopping after {MAX_CONSECUTIVE_FAILURES} consecutive download failures. "
-                                    "This may indicate an IP ban or site issue."
-                                )
+                            page = failures.failure(page)
             else:
                 # Get configured categories (defaults to just "tv")
                 configured_categories = get_config(config, "categories", ["tv"])
@@ -1082,13 +1155,13 @@ def main():
                         cat_urls_str = brand_record.get("tv_category_urls", "")
                         category_urls = [url.strip() for url in cat_urls_str.split(",") if url.strip()]
 
-                        scrape_brand(page, brand, download_dir, download=not args.index_only, category_urls=category_urls, captcha_solver=captcha_solver)
+                        scrape_brand(page, brand, download_dir, download=not args.index_only, category_urls=category_urls, captcha_solver=captcha_solver, rotate_page=rotate_page)
                         database.mark_brand_scraped(brand_record["id"])
                         random_delay(3, 6)
                 else:
                     # Use brands from config or CLI with configured categories
                     for brand in brands:
-                        scrape_brand(page, brand, download_dir, download=not args.index_only, categories=configured_categories, captcha_solver=captcha_solver)
+                        scrape_brand(page, brand, download_dir, download=not args.index_only, categories=configured_categories, captcha_solver=captcha_solver, rotate_page=rotate_page)
                         random_delay(3, 6)
         except DownloadLimitReached:
             logger.info(f"Download limit reached ({DOWNLOAD_LIMIT}). Stopping.")
