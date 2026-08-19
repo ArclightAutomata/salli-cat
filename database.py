@@ -6,7 +6,10 @@ DB_PATH = Path(__file__).parent / "manuals.db"
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout + WAL let multiple scraper processes share the DB without
+    # "database is locked" errors (WAL readers don't block the writer)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
