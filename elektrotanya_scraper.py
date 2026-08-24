@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Scraper for elektrotanya.com service manuals.
+
+Unlike the ManualsLib/ManualsBase/Manualzz scrapers, elektrotanya serves plain
+HTML with no Cloudflare challenge or captcha on the search and download paths,
+so this scraper uses stdlib urllib rather than Playwright.
+
+Flow:
+  1. Index: GET /showresult?what=<query>&kategoria=<cat>&kat2=all
+     Each result row is
+       <a href="/<slug>/download.html" title="[<Category> - <DocType>]: <desc>">
+     We record one row per result (manual_url = the absolute download-page URL).
+  2. Download: fetch the download page, regex out the JS-built form's `fid` and
+     `file`, then GET /cgi-bin/download2.cgi?dk=&fid=<fid>&file=<file> with a
+     Referer header. The site allows 10 files/day per IP; when the limit is hit
+     download2.cgi returns an HTML page instead of a PDF, which we detect and
+     stop on.
+
+Config (config.yaml, namespace `elektrotanya`, all optional):
+  queries:      list of free-text search terms (max 30 chars each; elektrotanya
+                caps the search box at 30). Defaults to the manualslib brand list.
+  categories:   list of `kategoria` filter slugs (e.g. tv, monitor). Default ["tv"].
+  daily_limit:  max downloads per run (default 10, the site's free ceiling).
+"""
+
+import argparse
+import hashlib
+import html
+import http.cookiejar
+import logging
+import random
+import re
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import yaml
+
+import database
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+BASE_URL = "https://elektrotanya.com"
+SOURCE = "elektrotanya"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+SEARCH_MAXLEN = 30  # the site's search box maxlength
+
+# One result row: href to a /<slug>/download.html page, plus a title carrying
+# "[<Category> - <DocType>]: <description>".
+ROW_RE = re.compile(
+    r'<a href="(/[^"]+?/download\.html)"[^>]*title="\[([^\]]+)\]:\s*([^"]+?)"',
+    re.IGNORECASE,
+)
+# The download page builds its form in JS: fid + file live in hidden inputs.
+FID_RE = re.compile(r"name=\\?[\"']fid\\?[\"']\s+value=\\?[\"'](\d+)\\?[\"']")
+FILE_RE = re.compile(r"name=\\?[\"']file\\?[\"']\s+value=\\?[\"']([^\"'\\]+)")
+
+DELAY_MIN = 2.0
+DELAY_MAX = 5.0
+
+
+def load_config() -> dict:
+    config_path = Path(__file__).parent / "config.yaml"
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def get_config(config: dict, key: str, default=None, namespace: str = SOURCE):
+    """Namespace override then global fallback (matches the other scrapers)."""
+    ns_config = config.get(namespace, {})
+    if key in ns_config:
+        return ns_config[key]
+    return config.get(key, default)
+
+
+def random_delay(min_sec: float = None, max_sec: float = None):
+    min_sec = DELAY_MIN if min_sec is None else min_sec
+    max_sec = DELAY_MAX if max_sec is None else max_sec
+    time.sleep(random.uniform(min_sec, max_sec))
+
+
+# A cookie-aware opener shared across the run. The download endpoint
+# (/cgi-bin/download2.cgi) rejects requests that don't carry the session
+# cookies (_captchaq, _experience, be) set when the download page is fetched —
+# so get_download_info() and the subsequent cgi GET must share one cookie jar.
+_COOKIE_JAR = http.cookiejar.CookieJar()
+_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
+
+
+def _http_get(url: str, referer: str = None, timeout: int = 30) -> tuple[bytes, str]:
+    """GET a URL through the shared cookie jar. Returns (body_bytes, content_type)."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
+    with _OPENER.open(req, timeout=timeout) as resp:
+        return resp.read(), resp.headers.get("Content-Type", "")
+
+
+def get_sha1_storage_path(download_dir: Path, sha1: str, extension: str = ".pdf") -> Path:
+    """git-style trie path ab/cd/abcdef... — identical to the other scrapers."""
+    if len(sha1) < 4:
+        raise ValueError(f"SHA1 hash too short: {sha1}")
+    return download_dir / sha1[:2] / sha1[2:4] / (sha1 + extension)
+
+
+def compute_checksums_bytes(data: bytes) -> tuple[str, str]:
+    return hashlib.sha1(data).hexdigest(), hashlib.md5(data).hexdigest()
+
+
+def parse_doc_type(meta: str) -> str:
+    """From a '[TV - Service Manual]' bracket, take the part after the dash."""
+    if " - " in meta:
+        return meta.split(" - ", 1)[1].strip()
+    return meta.strip()
+
+
+def parse_category(meta: str) -> str:
+    return meta.split(" - ", 1)[0].strip() if " - " in meta else meta.strip()
+
+
+def guess_brand(description: str) -> str:
+    """First token of the description is reliably the brand on elektrotanya."""
+    desc = description.strip()
+    return desc.split()[0].lower() if desc else "unknown"
+
+
+def clean_model(description: str) -> str:
+    """Human-readable model/title: drop a trailing file extension."""
+    return re.sub(r"\.(pdf|djvu|zip|rar|jpg)$", "", description.strip(), flags=re.I)
+
+
+def search(query: str, kategoria: str = "tv") -> list[dict]:
+    """Run one search and return parsed result rows."""
+    params = {"what": query[:SEARCH_MAXLEN], "kategoria": kategoria, "kat2": "all"}
+    url = f"{BASE_URL}/showresult?" + urllib.parse.urlencode(params)
+    try:
+        body, _ = _http_get(url)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("search failed for %r (%s): %s", query, kategoria, e)
+        return []
+
+    text = body.decode("utf-8", errors="replace")
+    results = []
+    seen = set()
+    for href, meta, desc in ROW_RE.findall(text):
+        if href in seen:
+            continue
+        seen.add(href)
+        desc = html.unescape(desc)
+        results.append(
+            {
+                "manual_url": BASE_URL + href,
+                "category": parse_category(meta),
+                "doc_type": parse_doc_type(meta),
+                "brand": guess_brand(desc),
+                "model": clean_model(desc),
+            }
+        )
+    return results
+
+
+def get_download_info(download_page_url: str) -> tuple[str, str] | None:
+    """Fetch a download page and pull (fid, filename) from its JS form."""
+    try:
+        body, _ = _http_get(download_page_url)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("download page fetch failed %s: %s", download_page_url, e)
+        return None
+    text = body.decode("utf-8", errors="replace")
+    fid = FID_RE.search(text)
+    fname = FILE_RE.search(text)
+    if not fid or not fname:
+        logger.warning("no fid/file on %s", download_page_url)
+        return None
+    return fid.group(1), fname.group(1)
+
+
+def index(queries: list[str], categories: list[str]) -> int:
+    """Search every query×category, add new rows to the DB. Returns new count."""
+    added = 0
+    for kategoria in categories:
+        for query in queries:
+            rows = search(query, kategoria)
+            logger.info("search %r [%s]: %d results", query, kategoria, len(rows))
+            for row in rows:
+                manual_id = database.add_manual(
+                    brand=row["brand"],
+                    model=row["model"],
+                    manual_url=row["manual_url"],
+                    doc_type=row["doc_type"],
+                    source=SOURCE,
+                    source_id=row["manual_url"].rsplit("/download.html", 1)[0].lstrip("/"),
+                    category=row["category"],
+                )
+                if manual_id:
+                    added += 1
+            random_delay()
+    logger.info("indexed %d new elektrotanya manuals", added)
+    return added
+
+
+def download_manual(manual: dict, download_dir: Path) -> bool:
+    """Download one manual's PDF. Returns True on success, False on limit/error.
+
+    A False return from a genuine daily-limit hit is signalled by raising
+    DailyLimitReached so the caller can stop the whole run.
+    """
+    info = get_download_info(manual["manual_url"])
+    if not info:
+        return False
+    fid, filename = info
+    random_delay()
+
+    dl_url = f"{BASE_URL}/cgi-bin/download2.cgi?" + urllib.parse.urlencode(
+        {"dk": "", "fid": fid, "file": filename}
+    )
+    try:
+        data, content_type = _http_get(dl_url, referer=manual["manual_url"], timeout=120)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("download failed for fid=%s: %s", fid, e)
+        return False
+
+    # A PDF starts with %PDF; djvu/zip/rar are also valid manual payloads. An
+    # HTML body means the daily limit (or an error) — stop the run.
+    is_binary = "text/html" not in content_type.lower() and not data[:512].lstrip().startswith(b"<")
+    looks_like_doc = data[:5] == b"%PDF-" or data[:4] in (b"AT&T", b"PK\x03\x04", b"Rar!") or is_binary
+    if not looks_like_doc:
+        raise DailyLimitReached(
+            f"non-file response for fid={fid} (content-type {content_type!r}); "
+            "likely the 10-files/day limit"
+        )
+
+    ext = ".pdf"
+    low = filename.lower()
+    for cand in (".djvu", ".zip", ".rar", ".jpg"):
+        if low.endswith(cand):
+            ext = cand
+            break
+
+    sha1, md5 = compute_checksums_bytes(data)
+    final_path = get_sha1_storage_path(download_dir, sha1, ext)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_bytes(data)
+
+    database.update_downloaded(
+        manual["id"],
+        str(final_path),
+        file_sha1=sha1,
+        file_md5=md5,
+        file_size=len(data),
+        original_filename=filename,
+    )
+    logger.info("downloaded %s (%s, %d bytes)", filename, sha1[:8], len(data))
+    return True
+
+
+class DailyLimitReached(Exception):
+    """Raised when elektrotanya's 10-files/day limit is hit."""
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Scrape elektrotanya.com manuals")
+    parser.add_argument("--index-only", action="store_true", help="Only build the index, don't download")
+    parser.add_argument("--download-only", action="store_true", help="Only download pending manuals")
+    parser.add_argument("--query", nargs="*", help="Search terms (overrides config queries)")
+    parser.add_argument("--kategoria", nargs="*", help="Category filters (overrides config)")
+    parser.add_argument("--limit", type=int, default=None, help="Max downloads this run (default: daily_limit)")
+    parser.add_argument("--clear", action="store_true", help="Clear elektrotanya records before scraping")
+    args = parser.parse_args()
+
+    database.init_db()
+    config = load_config()
+
+    global DELAY_MIN, DELAY_MAX
+    DELAY_MIN = float(get_config(config, "delay_min", 2.0))
+    DELAY_MAX = float(get_config(config, "delay_max", 5.0)) or DELAY_MIN
+
+    if args.clear:
+        database.clear_manuals_by_source(SOURCE)
+        logger.info("cleared existing elektrotanya records")
+
+    # Default queries: the CRT-relevant brand list already configured for
+    # ManualsLib, so the two sources cover the same brands.
+    default_queries = get_config(config, "brands", [], namespace="manualslib") or [
+        "sony", "panasonic", "rca", "jvc", "toshiba", "sharp", "hitachi", "zenith",
+    ]
+    queries = args.query or get_config(config, "queries", default_queries)
+    categories = args.kategoria or get_config(config, "categories", ["tv"])
+    daily_limit = args.limit if args.limit is not None else int(get_config(config, "daily_limit", 10))
+
+    download_dir = Path(get_config(config, "download_dir", "./downloads"))
+
+    if not args.download_only:
+        index(queries, categories)
+
+    if args.index_only:
+        return
+
+    pending = database.get_undownloaded_manuals(source=SOURCE)
+    logger.info("%d elektrotanya manuals pending download; run limit %d", len(pending), daily_limit)
+
+    done = 0
+    for manual in pending:
+        if done >= daily_limit:
+            logger.info("hit run limit of %d downloads; stopping", daily_limit)
+            break
+        try:
+            if download_manual(manual, download_dir):
+                done += 1
+        except DailyLimitReached as e:
+            logger.warning("%s — stopping (try again tomorrow or use a proxy)", e)
+            break
+        random_delay()
+
+    logger.info("elektrotanya run complete: %d downloaded", done)
+
+
+if __name__ == "__main__":
+    main()

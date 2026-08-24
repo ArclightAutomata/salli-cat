@@ -127,12 +127,43 @@ def scrape_manualzz(urls, index_only, download_only, clear):
     main()
 
 
+@scrape.command("elektrotanya")
+@click.option("--query", multiple=True, help="Search terms (overrides config queries)")
+@click.option("--kategoria", multiple=True, help="Category filters, e.g. tv monitor (overrides config)")
+@click.option("--index-only", is_flag=True, help="Only build index, don't download")
+@click.option("--download-only", is_flag=True, help="Only download pending manuals")
+@click.option("--limit", type=int, help="Max downloads this run (default: 10, the site's daily cap)")
+@click.option("--clear", is_flag=True, help="Clear all elektrotanya records")
+def scrape_elektrotanya(query, kategoria, index_only, download_only, limit, clear):
+    """Scrape service manuals from elektrotanya.com (10 files/day per IP)."""
+    import sys
+
+    argv = []
+    if query:
+        argv.extend(["--query"] + list(query))
+    if kategoria:
+        argv.extend(["--kategoria"] + list(kategoria))
+    if index_only:
+        argv.append("--index-only")
+    if download_only:
+        argv.append("--download-only")
+    if limit is not None:
+        argv.extend(["--limit", str(limit)])
+    if clear:
+        argv.append("--clear")
+
+    sys.argv = ["elektrotanya_scraper"] + argv
+
+    from elektrotanya_scraper import main
+    main()
+
+
 # =============================================================================
 # Upload command
 # =============================================================================
 
 @cli.command()
-@click.option("--source", type=click.Choice(["manualslib", "manualsbase", "manualzz"]),
+@click.option("--source", type=click.Choice(["manualslib", "manualsbase", "manualzz", "elektrotanya"]),
               help="Source to upload from (default: all sources)")
 @click.option("--limit", type=int, help="Limit number of uploads")
 @click.option("--dry-run", is_flag=True, help="Preview uploads without uploading")
@@ -224,7 +255,7 @@ def status():
     click.echo(f"  Pending:          {stats['pending']:,}")
 
     # Per-source stats
-    for source in ["manualslib", "manualsbase", "manualzz"]:
+    for source in ["manualslib", "manualsbase", "manualzz", "elektrotanya"]:
         source_stats = database.get_stats(source=source)
         if source_stats['total'] > 0:
             click.echo(f"\n{source.capitalize()}:")
@@ -268,7 +299,7 @@ def clear_all():
 
 
 @clear.command("manuals")
-@click.option("--source", type=click.Choice(["manualslib", "manualsbase", "manualzz"]),
+@click.option("--source", type=click.Choice(["manualslib", "manualsbase", "manualzz", "elektrotanya"]),
               help="Only clear records from this source")
 @click.confirmation_option(prompt="Are you sure you want to clear manual records?")
 def clear_manuals(source):

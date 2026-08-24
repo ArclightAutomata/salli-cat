@@ -21,6 +21,29 @@ use_proxy: false
 delay_min: 0
 delay_max: 0
 
+# Elektrotanya settings
+elektrotanya:
+  # Free-text search terms (each capped at 30 chars by the site). Defaults to
+  # the manualslib brand list below if omitted.
+  queries:
+    - sony
+    - panasonic
+    - rca
+    - jvc
+    - toshiba
+    - sharp
+    - hitachi
+    - zenith
+  # Category filters (the site's `kategoria` select). tv + monitor cover CRTs.
+  categories:
+    - tv
+    - monitor
+  # Downloads per run — the site allows 10 files/day per IP without an account.
+  daily_limit: 10
+  # Politeness (elektrotanya is a small community site — don't hammer it).
+  delay_min: 3
+  delay_max: 7
+
 # ManualsLib settings
 manualslib:
   brands:
@@ -35,7 +58,7 @@ manualslib:
     - tv-dvd-combo
     - tv-vcr-combo
   # Override global settings for this scraper:
-  use_proxy: true
+  use_proxy: false
   # browser: firefox
   # stealth: false
   headless: true
