@@ -803,57 +803,32 @@ def download_manual(page: Page, manual: dict, download_dir: Path, brand: str, ca
         return str(final_path), original_sha1, original_md5, original_file_size, original_filename, None, None, None, None
 
 
-def scrape_brand(page: Page, brand: str, download_dir: Path, download: bool = True, category_urls: list[str] = None, categories: list[str] = None, captcha_solver: TwoCaptchaSolver = None, rotate_page=None):
-    """Scrape all CRT manuals for a brand.
-
-    Args:
-        page: Playwright page object
-        brand: Brand slug
-        download_dir: Directory to download files to
-        download: Whether to download files after scraping
-        category_urls: List of full category URLs to scrape (from discovered brands)
-        categories: List of category slugs like ['tv', 'tv-dvd-combo'] to build URLs from
-        captcha_solver: Optional 2captcha solver for automatic captcha solving
-        rotate_page: Optional callable that relaunches the browser with a fresh
-                     proxy session (new exit IP) and returns the new page. Called
-                     after each download failure so the circuit breaker only trips
-                     if multiple different IPs fail.
+def download_pending(page: Page, brand: str, download_dir: Path, captcha_solver, failures: DownloadFailureTracker) -> Page:
     """
-    logger.info(f"Starting scrape for brand: {brand}")
+    Download a brand's pending manuals (not downloaded, not archived).
 
-    # Determine which category URLs to scrape
-    urls_to_scrape = []
-    if category_urls:
-        # Use provided category URLs (from discovered brands)
-        urls_to_scrape = [(url, None) for url in category_urls]
-    elif categories:
-        # Build URLs from category slugs
-        for cat in categories:
-            url = f"{BASE_URL}/brand/{brand}/{cat}.html"
-            urls_to_scrape.append((url, cat))
-    else:
-        # Default to just "tv" category
-        urls_to_scrape = [(f"{BASE_URL}/brand/{brand}/tv.html", "tv")]
+    ManualsLib lists one document under every model it covers, so many pending
+    rows are siblings sharing a manualslib_id. Each document is only fetched
+    once: siblings reuse the first download (or its archive.org status).
 
-    # Scrape all category listings
-    total_manual_count = 0
-    for cat_url, cat_name in urls_to_scrape:
-        manual_count = scrape_category_listing(page, brand, cat_url, cat_name)
-        total_manual_count += manual_count
-        random_delay(1, 2)
+    Returns the page to keep using (it changes when the proxy IP is rotated).
+    """
+    archived, reused = database.sync_sibling_manuals()
+    if reused or archived:
+        logger.info(f"Resolved from sibling manuals: {reused} reuse an existing download, {archived} already archived")
 
-    if not download:
-        logger.info(f"Scraping complete for {brand}. Found {total_manual_count} manuals. Skipping downloads.")
-        return
-
-    # Download manuals that haven't been downloaded yet (excludes archived)
     pending = database.get_undownloaded_manuals(brand)
     logger.info(f"Found {len(pending)} manuals to download for {brand}")
 
-    failures = DownloadFailureTracker(rotate_page)
-
     for manual_record in pending:
         try:
+            # The pending list is a snapshot: a sibling handled earlier in this
+            # run may have already taken care of this document
+            resolved = database.resolve_from_siblings(manual_record["id"])
+            if resolved:
+                logger.info(f"Skipping {manual_record['model']}: same document as a sibling manual ({resolved})")
+                continue
+
             # Check download limit before each download
             check_download_limit()
 
@@ -897,7 +872,54 @@ def scrape_brand(page: Page, brand: str, download_dir: Path, download: bool = Tr
         except Exception as e:
             logger.error(f"Error downloading {manual_record['model']}: {e}")
             page = failures.failure(page)
-            continue
+
+    return page
+
+
+def scrape_brand(page: Page, brand: str, download_dir: Path, download: bool = True, category_urls: list[str] = None, categories: list[str] = None, captcha_solver: TwoCaptchaSolver = None, rotate_page=None):
+    """Scrape all CRT manuals for a brand.
+
+    Args:
+        page: Playwright page object
+        brand: Brand slug
+        download_dir: Directory to download files to
+        download: Whether to download files after scraping
+        category_urls: List of full category URLs to scrape (from discovered brands)
+        categories: List of category slugs like ['tv', 'tv-dvd-combo'] to build URLs from
+        captcha_solver: Optional 2captcha solver for automatic captcha solving
+        rotate_page: Optional callable that relaunches the browser with a fresh
+                     proxy session (new exit IP) and returns the new page. Called
+                     after each download failure so the circuit breaker only trips
+                     if multiple different IPs fail.
+    """
+    logger.info(f"Starting scrape for brand: {brand}")
+
+    # Determine which category URLs to scrape
+    urls_to_scrape = []
+    if category_urls:
+        # Use provided category URLs (from discovered brands)
+        urls_to_scrape = [(url, None) for url in category_urls]
+    elif categories:
+        # Build URLs from category slugs
+        for cat in categories:
+            url = f"{BASE_URL}/brand/{brand}/{cat}.html"
+            urls_to_scrape.append((url, cat))
+    else:
+        # Default to just "tv" category
+        urls_to_scrape = [(f"{BASE_URL}/brand/{brand}/tv.html", "tv")]
+
+    # Scrape all category listings
+    total_manual_count = 0
+    for cat_url, cat_name in urls_to_scrape:
+        manual_count = scrape_category_listing(page, brand, cat_url, cat_name)
+        total_manual_count += manual_count
+        random_delay(1, 2)
+
+    if not download:
+        logger.info(f"Scraping complete for {brand}. Found {total_manual_count} manuals. Skipping downloads.")
+        return
+
+    download_pending(page, brand, download_dir, captcha_solver, DownloadFailureTracker(rotate_page))
 
 
 def main():
@@ -1096,53 +1118,7 @@ def main():
                 # Only download pending manuals
                 failures = DownloadFailureTracker(rotate_page)
                 for brand in brands:
-                    pending = database.get_undownloaded_manuals(brand)
-                    logger.info(f"Downloading {len(pending)} pending manuals for {brand}")
-                    for manual_record in pending:
-                        try:
-                            # Check download limit before each download
-                            check_download_limit()
-
-                            # Extract manualslib_id if not already in DB
-                            manualslib_id = manual_record.get("manualslib_id")
-                            if not manualslib_id:
-                                manualslib_id = extract_manualslib_id(manual_record["manual_url"])
-                                if manualslib_id:
-                                    database.update_manualslib_id(manual_record["id"], manualslib_id)
-
-                            # Check if already archived on archive.org
-                            if manualslib_id:
-                                logger.info(f"Checking archive.org for {manual_record['model']} (ID: {manualslib_id})...")
-                                is_archived, archive_url = check_archive_org(manualslib_id)
-                                if is_archived:
-                                    logger.info(f"Already archived: {archive_url}")
-                                    database.update_archived(manual_record["id"], archive_url)
-                                    continue
-
-                            # Not archived, proceed with download
-                            result = download_manual(
-                                page,
-                                {"model": manual_record["model"], "url": manual_record["manual_url"], "doc_type": manual_record["doc_type"]},
-                                download_dir,
-                                brand,
-                                captcha_solver=captcha_solver
-                            )
-                            if result:
-                                file_path, sha1, md5, file_size, original_filename, original_sha1, original_md5, original_file_path, original_file_size = result
-                                database.update_downloaded(
-                                    manual_record["id"], file_path, sha1, md5, file_size, original_filename,
-                                    original_sha1, original_md5, original_file_path, original_file_size
-                                )
-                                failures.success()
-                                increment_download_count()
-                            else:
-                                page = failures.failure(page)
-                            random_delay()
-                        except (DownloadCircuitBreakerError, DownloadLimitReached):
-                            raise  # Re-raise to stop
-                        except Exception as e:
-                            logger.error(f"Error downloading {manual_record['model']}: {e}")
-                            page = failures.failure(page)
+                    page = download_pending(page, brand, download_dir, captcha_solver, failures)
             else:
                 # Get configured categories (defaults to just "tv")
                 configured_categories = get_config(config, "categories", ["tv"])

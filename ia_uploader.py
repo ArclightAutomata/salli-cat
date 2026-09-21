@@ -334,14 +334,19 @@ def get_uploadable_manuals(source: str = None, limit: int = None) -> list[dict]:
 
     query += " ORDER BY brand, model"
 
-    if limit:
-        query += " LIMIT ?"
-        params.append(limit)
-
     cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+
+    # One document can be listed under many models (sibling rows sharing an IA
+    # identifier). Upload it once - update_archived marks the siblings too.
+    manuals = {}
+    for row in rows:
+        manual = dict(row)
+        # Rows without a source ID aren't siblings of anything - keep them all
+        manuals.setdefault(build_identifier(manual, fallback=False) or manual["id"], manual)
+    manuals = list(manuals.values())
+    return manuals[:limit] if limit else manuals
 
 
 def upload_all_pending(
@@ -358,6 +363,10 @@ def upload_all_pending(
     Returns:
         Tuple of (successful_count, failed_count)
     """
+    archived, _ = database.sync_sibling_manuals()
+    if archived:
+        logger.info(f"Marked {archived} manuals as archived (same document as an already-archived manual)")
+
     manuals = get_uploadable_manuals(source=source, limit=limit)
     logger.info(f"Found {len(manuals)} manuals to upload")
 
@@ -368,7 +377,9 @@ def upload_all_pending(
         archive_url = upload_manual_to_ia(manual)
 
         if archive_url:
-            database.update_archived(manual["id"], archive_url)
+            siblings = database.update_archived(manual["id"], archive_url)
+            if siblings:
+                logger.info(f"  Also marked {siblings} other model(s) covered by this document as archived")
             success += 1
         else:
             failed += 1

@@ -14,6 +14,24 @@ def get_connection():
     return conn
 
 
+# Sites list one document under every model it covers, so several rows (one per
+# model) can point at the same document. Such "sibling" rows share a source and
+# a source-side document ID, and therefore a single Internet Archive item - the
+# document only needs to be downloaded and uploaded once for all of them.
+SIBLING_KEY = "COALESCE(manualslib_id, source_id)"
+
+
+def _sibling_key(alias: str) -> str:
+    """SIBLING_KEY with its columns qualified by a table alias."""
+    return f"COALESCE({alias}.manualslib_id, {alias}.source_id)"
+
+
+_DOWNLOAD_COLUMNS = (
+    "file_path", "file_sha1", "file_md5", "file_size", "downloaded_at",
+    "original_filename", "original_file_sha1", "original_file_md5",
+)
+
+
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
@@ -95,6 +113,7 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded ON manuals(downloaded)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_archived ON manuals(archived)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_source ON manuals(source)")
+    cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_manuals_sibling_key ON manuals(source, {SIBLING_KEY})")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_brands_slug ON brands(slug)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_brands_scraped ON brands(scraped)")
 
@@ -475,7 +494,24 @@ def update_downloaded(
     conn.close()
 
 
-def update_archived(manual_id: int, archive_url: str):
+def _mark_siblings_archived(cursor, manual_id: int, archive_url: str) -> int:
+    """Mark the not-yet-archived siblings of a manual as archived. Returns count."""
+    cursor.execute(f"""
+        UPDATE manuals
+        SET archived = 1, archive_url = ?
+        WHERE archived = 0
+          AND id != ?
+          AND source = (SELECT source FROM manuals WHERE id = ?)
+          AND {SIBLING_KEY} = (SELECT {SIBLING_KEY} FROM manuals WHERE id = ?)
+    """, (archive_url, manual_id, manual_id, manual_id))
+    return cursor.rowcount
+
+
+def update_archived(manual_id: int, archive_url: str) -> int:
+    """
+    Mark a manual - and its siblings, which live in the same Internet Archive
+    item - as archived. Returns the number of siblings that were also marked.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -483,8 +519,115 @@ def update_archived(manual_id: int, archive_url: str):
         SET archived = 1, archive_url = ?
         WHERE id = ?
     """, (archive_url, manual_id))
+    siblings = _mark_siblings_archived(cursor, manual_id, archive_url)
     conn.commit()
     conn.close()
+    return siblings
+
+
+def _copy_download(cursor, manual_id: int, donor_id: int):
+    """Point a manual at its sibling's already-downloaded files."""
+    columns = ", ".join(f"{col} = (SELECT {col} FROM manuals WHERE id = :donor)" for col in _DOWNLOAD_COLUMNS)
+    cursor.execute(
+        f"UPDATE manuals SET downloaded = 1, {columns} WHERE id = :id",
+        {"id": manual_id, "donor": donor_id},
+    )
+    cursor.execute("""
+        INSERT OR IGNORE INTO file_variants
+        (manual_id, variant_type, file_path, file_sha1, file_md5, file_size, is_primary)
+        SELECT ?, variant_type, file_path, file_sha1, file_md5, file_size, is_primary
+        FROM file_variants WHERE manual_id = ?
+    """, (manual_id, donor_id))
+
+
+def _find_download_donor(cursor, manual_id: int) -> int | None:
+    """Find a sibling whose downloaded file still exists on disk."""
+    cursor.execute(f"""
+        SELECT s.id, s.file_path FROM manuals s
+        JOIN manuals m ON m.id = ?
+        WHERE s.id != m.id
+          AND s.source = m.source
+          AND {_sibling_key('s')}
+            = {_sibling_key('m')}
+          AND s.downloaded = 1
+          AND s.file_path IS NOT NULL
+        ORDER BY s.id
+    """, (manual_id,))
+    for row in cursor.fetchall():
+        if Path(row["file_path"]).exists():
+            return row["id"]
+    return None
+
+
+def resolve_from_siblings(manual_id: int) -> str | None:
+    """
+    Check whether a pending manual still needs downloading, given its siblings.
+
+    Returns "archived" if it has been marked archived (e.g. a sibling was found
+    on archive.org since the pending list was read), "downloaded" if it is
+    downloaded or a sibling's download could be reused for it, else None.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT downloaded, archived FROM manuals WHERE id = ?", (manual_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        if row["archived"]:
+            return "archived"
+        if row["downloaded"]:
+            return "downloaded"
+        donor_id = _find_download_donor(cursor, manual_id)
+        if donor_id is None:
+            return None
+        _copy_download(cursor, manual_id, donor_id)
+        conn.commit()
+        return "downloaded"
+    finally:
+        conn.close()
+
+
+def sync_sibling_manuals() -> tuple[int, int]:
+    """
+    Bring sibling rows in line with each other: rows with an archived sibling
+    are marked archived, and pending rows with a downloaded sibling reuse its
+    files. Idempotent. Returns (newly_archived, newly_downloaded).
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sibling = f"""
+        FROM manuals s
+        WHERE s.id != manuals.id
+          AND s.source = manuals.source
+          AND {_sibling_key('s')}
+            = {_sibling_key('manuals')}
+    """
+    cursor.execute(f"""
+        UPDATE manuals
+        SET archived = 1,
+            archive_url = (SELECT s.archive_url {sibling} AND s.archived = 1 AND s.archive_url IS NOT NULL ORDER BY s.id LIMIT 1)
+        WHERE archived = 0
+          AND EXISTS (SELECT 1 {sibling} AND s.archived = 1 AND s.archive_url IS NOT NULL)
+    """)
+    archived = cursor.rowcount
+
+    cursor.execute(f"""
+        SELECT id FROM manuals
+        WHERE downloaded = 0 AND archived = 0
+          AND EXISTS (SELECT 1 {sibling} AND s.downloaded = 1 AND s.file_path IS NOT NULL)
+    """)
+    downloaded = 0
+    for row in cursor.fetchall():
+        donor_id = _find_download_donor(cursor, row["id"])
+        if donor_id is not None:
+            _copy_download(cursor, row["id"], donor_id)
+            downloaded += 1
+
+    conn.commit()
+    conn.close()
+    return archived, downloaded
 
 
 def update_manualslib_id(manual_id: int, manualslib_id: str):
@@ -536,6 +679,7 @@ def update_archive_checked(manual_id: int, is_archived: bool, archive_url: str =
             SET archived = 1, archive_url = ?, archive_checked_at = ?
             WHERE id = ?
         """, (archive_url, checked_at, manual_id))
+        _mark_siblings_archived(cursor, manual_id, archive_url)
     else:
         cursor.execute("""
             UPDATE manuals
