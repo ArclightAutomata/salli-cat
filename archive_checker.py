@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 
 import database
+from ia_uploader import build_identifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,22 +30,9 @@ DEFAULT_BATCH_PAUSE = 60  # Seconds to pause between batches
 
 def get_archive_url_for_manual(manual: dict) -> str | None:
     """Get the expected archive.org URL for a manual based on its source."""
-    source = manual.get("source", "manualslib")
-
-    if source == "manualsbase":
-        source_id = manual.get("source_id")
-        if source_id:
-            return f"https://archive.org/details/manualsbase-id-{source_id}"
-    elif source == "manualzz":
-        source_id = manual.get("source_id")
-        if source_id:
-            return f"https://archive.org/details/manualzz-id-{source_id}"
-    else:
-        # ManualsLib (default)
-        manualslib_id = manual.get("manualslib_id") or manual.get("source_id")
-        if manualslib_id:
-            return f"https://archive.org/details/manualslib-id-{manualslib_id}"
-
+    identifier = build_identifier(manual, fallback=False)
+    if identifier:
+        return f"https://archive.org/details/{identifier}"
     return None
 
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Internet Archive uploader for manual PDFs (ManualsLib, ManualsBase, etc.)."""
 
+import hashlib
 import logging
 import re
 import subprocess
@@ -42,25 +43,103 @@ def sanitize_xml_string(text: str) -> str:
     return cleaned
 
 
+IA_IDENTIFIER_MAX_LEN = 100
+# What archive.org accepts: alphanumeric start, then alphanumerics/_/-/., 5-100 chars.
+IA_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{4,99}$")
+
+
+def _clean_identifier_chars(text: str) -> str:
+    """Reduce text to the identifier-safe alphabet [a-zA-Z0-9_-]."""
+    # Replace spaces and special chars with underscores
+    cleaned = re.sub(r'[^a-zA-Z0-9_-]', '_', text)
+    # Collapse multiple underscores
+    cleaned = re.sub(r'_+', '_', cleaned)
+    # Remove leading/trailing underscores
+    return cleaned.strip('_')
+
+
 def sanitize_identifier(text: str) -> str:
     """
     Create a valid Internet Archive identifier from text.
 
     IA identifiers must be 5-100 chars, alphanumeric with underscores/dashes.
     """
-    # Replace spaces and special chars with underscores
-    identifier = re.sub(r'[^a-zA-Z0-9_-]', '_', text)
-    # Collapse multiple underscores
-    identifier = re.sub(r'_+', '_', identifier)
-    # Remove leading/trailing underscores
-    identifier = identifier.strip('_')
+    identifier = _clean_identifier_chars(text)
     # Ensure minimum length
     if len(identifier) < 5:
         identifier = identifier + '_manual'
     # Truncate if too long
-    if len(identifier) > 100:
-        identifier = identifier[:100]
+    if len(identifier) > IA_IDENTIFIER_MAX_LEN:
+        identifier = identifier[:IA_IDENTIFIER_MAX_LEN]
     return identifier
+
+
+SLUG_HASH_LEN = 8
+
+
+def slug_identifier(prefix: str, slug: str) -> str:
+    """
+    Build an IA identifier from a source's textual key (a URL slug / file name):
+    ``<prefix>-<sanitized slug>-<short sha1 of the raw slug>``.
+
+    Unlike numeric IDs, slugs can be long and contain arbitrary characters.
+    Sanitizing is lossy (``x.pdf`` and ``x_pdf`` collapse together) and the
+    100-char limit may force truncation, so a hash of the *full, raw* slug is
+    always appended: the identifier stays human-readable while uniqueness comes
+    from the hash. When the readable part doesn't fit it is cut, never the hash.
+    """
+    digest = hashlib.sha1(slug.encode("utf-8")).hexdigest()[:SLUG_HASH_LEN]
+    readable = f"{prefix}-{_clean_identifier_chars(slug)}"
+    keep = IA_IDENTIFIER_MAX_LEN - len(digest) - 1
+    if len(readable) > keep:
+        readable = readable[:keep].rstrip('_-')
+    return f"{readable}-{digest}"
+
+
+def build_identifier(manual: dict, fallback: bool = True) -> str | None:
+    """
+    Return the Internet Archive identifier for a manual.
+
+    Each source has a stable key that makes the identifier deterministic, so
+    uploads, archive checks and verification all agree on the same item:
+      manualslib:   manualslib-id-<numeric id>
+      manualsbase:  manualsbase-id-<numeric id>
+      manualzz:     manualzz-id-<numeric id>
+      elektrotanya: elektrotanya-<url slug>-<sha1(slug)[:8]>
+                    (the site has no numeric IDs; the slug is its file name,
+                    e.g. "sony_kv-1400_sm.pdf" from /sony_kv-1400_sm.pdf/download.html,
+                    and the hash keeps the identifier unique after sanitizing
+                    and truncating - see slug_identifier)
+
+    When a manual has no stable key, ``fallback=True`` derives an identifier
+    from brand/model (used for uploads); ``fallback=False`` returns None (used
+    for existence checks, where a guessed identifier isn't worth a request).
+    """
+    source = manual.get("source") or "manualslib"
+    source_id = manual.get("source_id")
+
+    if source == "manualsbase":
+        if source_id:
+            return f"manualsbase-id-{source_id}"
+    elif source == "manualzz":
+        if source_id:
+            return f"manualzz-id-{source_id}"
+    elif source == "elektrotanya":
+        if source_id:
+            return slug_identifier("elektrotanya", source_id)
+    elif source == "manualslib":
+        manualslib_id = manual.get("manualslib_id") or source_id
+        if manualslib_id:
+            return f"manualslib-id-{manualslib_id}"
+    else:
+        # Unknown source: never borrow another source's namespace.
+        logger.warning(f"No identifier scheme for source {source!r}; using a sanitized generic one")
+        if source_id:
+            return slug_identifier(f"{source}-id", str(source_id))
+
+    if not fallback:
+        return None
+    return sanitize_identifier(f"{source}-{manual.get('brand', '')}-{manual.get('model', '')}")
 
 
 def build_upload_metadata(manual: dict) -> dict:
@@ -76,31 +155,9 @@ def build_upload_metadata(manual: dict) -> dict:
     else:
         file_path = manual.get("file_path")
 
-    source = manual.get("source", "manualslib")
-
-    # Create identifier based on source
-    if source == "manualsbase":
-        source_id = manual.get("source_id")
-        if source_id:
-            identifier = f"manualsbase-id-{source_id}"
-        else:
-            identifier = sanitize_identifier(f"manualsbase-{manual['brand']}-{manual['model']}")
-        subjects = ["manualsbase", "manuals"]
-    elif source == "manualzz":
-        source_id = manual.get("source_id")
-        if source_id:
-            identifier = f"manualzz-id-{source_id}"
-        else:
-            identifier = sanitize_identifier(f"manualzz-{manual['brand']}-{manual['model']}")
-        subjects = ["manualzz", "manuals"]
-    else:
-        # ManualsLib (default)
-        manualslib_id = manual.get("manualslib_id") or manual.get("source_id")
-        if manualslib_id:
-            identifier = f"manualslib-id-{manualslib_id}"
-        else:
-            identifier = sanitize_identifier(f"manualslib-{manual['brand']}-{manual['model']}")
-        subjects = ["manualslib", "manuals"]
+    source = manual.get("source") or "manualslib"
+    identifier = build_identifier(manual)
+    subjects = [source, "manuals"]
 
     # Build title: "Brand Model Document Type"
     brand = sanitize_xml_string(manual.get("brand", "Unknown"))
@@ -209,9 +266,19 @@ def upload_manual_to_ia(manual: dict) -> str | None:
     logger.info(f"  Local file: {file_path}")
     logger.info(f"  Remote filename: {remote_filename}")
 
+    # An identifier with characters like ':' or '/' makes the IA client hit the
+    # wrong URL, whose error response looks like an existing item - refuse it
+    # here rather than marking the manual archived without uploading anything.
+    if not IA_IDENTIFIER_RE.match(identifier):
+        logger.error(f"Invalid Internet Archive identifier {identifier!r} - skipping")
+        return None
+
     try:
         # Check if item already exists
         item = ia.get_item(identifier)
+        if item.item_metadata.get("error"):
+            logger.error(f"Error looking up {identifier}: {item.item_metadata['error']}")
+            return None
         if item.exists:
             logger.info(f"Item already exists: https://archive.org/details/{identifier}")
             return f"https://archive.org/details/{identifier}"

@@ -7,6 +7,7 @@ import urllib.request
 import urllib.error
 
 import database
+from ia_uploader import build_identifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,12 +137,12 @@ def main():
 
         found_on_ia = []
         for i, manual in enumerate(unarchived, 1):
-            manualslib_id = manual.get("manualslib_id") or manual.get("source_id")
-            if not manualslib_id:
-                logger.info(f"[{i}/{len(unarchived)}] {manual['brand']} {manual['model']} - no manualslib_id, skipping")
+            identifier = build_identifier(manual, fallback=False)
+            if not identifier:
+                logger.info(f"[{i}/{len(unarchived)}] {manual['brand']} {manual['model']} - no source ID, skipping")
                 continue
 
-            archive_url = f"https://archive.org/details/manualslib-id-{manualslib_id}"
+            archive_url = f"https://archive.org/details/{identifier}"
             logger.info(f"[{i}/{len(unarchived)}] Checking {manual['brand']} {manual['model']}...")
 
             exists = check_ia_exists(archive_url)

@@ -156,9 +156,13 @@ def search(query: str, kategoria: str = "tv") -> list[dict]:
             continue
         seen.add(href)
         desc = html.unescape(desc)
+        # The slug (the site's file name) is elektrotanya's only stable key for
+        # a manual; it becomes source_id and the archive.org identifier.
+        slug = href.removeprefix("/").removesuffix("/download.html")
         results.append(
             {
                 "manual_url": BASE_URL + href,
+                "slug": slug,
                 "category": parse_category(meta),
                 "doc_type": parse_doc_type(meta),
                 "brand": guess_brand(desc),
@@ -198,7 +202,7 @@ def index(queries: list[str], categories: list[str]) -> int:
                     manual_url=row["manual_url"],
                     doc_type=row["doc_type"],
                     source=SOURCE,
-                    source_id=row["manual_url"].rsplit("/download.html", 1)[0].lstrip("/"),
+                    source_id=row["slug"],
                     category=row["category"],
                 )
                 if manual_id:
