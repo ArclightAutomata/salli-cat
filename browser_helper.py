@@ -5,11 +5,16 @@ import logging
 import os
 import secrets
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.sync_api import BrowserContext, Playwright, Page
+# patchright is a drop-in Playwright fork that hides the CDP automation leaks
+# (Runtime.enable etc.) Cloudflare's managed challenge detects. With stock
+# Playwright the "Just a moment..." page never resolves, even when a human
+# clicks the checkbox.
+from patchright.sync_api import BrowserContext, Playwright, Page
 from playwright_stealth import Stealth
 
 # Load environment variables from .env file
@@ -142,20 +147,17 @@ def launch_browser_with_extension(
         extension_path: Path to unpacked extension directory (must have manifest.json)
         headless: Run in headless mode (extensions may not work in headless)
         user_data_dir: Browser profile directory (created if None)
-        viewport: Viewport dimensions dict {"width": 1280, "height": 800}
-        user_agent: Custom user agent string
+        viewport: Viewport dimensions dict; None (default) lets the window size
+            rule, which is what a real browser looks like
+        user_agent: Custom user agent string; None (default) keeps the browser's
+            own. A UA that doesn't match the real Chrome build is a fingerprint
+            red flag for Cloudflare, so only set this deliberately.
         use_proxy: If True, use Bright Data Web Unlocker proxy if configured
         browser: Browser to use - "chromium", "firefox", or "webkit"
 
     Returns:
         BrowserContext
     """
-    if viewport is None:
-        viewport = {"width": 1280, "height": 800}
-
-    if user_agent is None:
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
     # Create user data dir if not provided
     if user_data_dir is None:
         user_data_dir = Path(tempfile.mkdtemp(prefix="playwright_profile_"))
@@ -205,6 +207,7 @@ def launch_browser_with_extension(
         headless=headless,
         args=browser_args if browser == "chromium" else [],
         viewport=viewport,
+        no_viewport=viewport is None,
         user_agent=user_agent,
         proxy=proxy,
         # Grant permissions commonly needed
@@ -216,6 +219,45 @@ def launch_browser_with_extension(
     )
 
     return context, extension_loaded
+
+
+CLOUDFLARE_CHALLENGE_TITLE = "just a moment"
+
+
+def is_cloudflare_challenge(page: Page) -> bool:
+    """True if the page is currently showing Cloudflare's challenge interstitial."""
+    try:
+        return CLOUDFLARE_CHALLENGE_TITLE in page.title().lower()
+    except Exception:
+        # Title lookup races with the redirect that follows a passed challenge
+        return False
+
+
+def wait_for_cloudflare(page: Page, timeout: float = 45.0) -> bool:
+    """
+    Wait for a Cloudflare managed challenge ("Just a moment...") to clear.
+
+    patchright passes the challenge on its own within a few seconds in a headful
+    browser; headless browsers never pass it. Returns False if the challenge is
+    still up after `timeout` seconds.
+    """
+    if not is_cloudflare_challenge(page):
+        return True
+    logger.info("Cloudflare challenge detected, waiting for it to clear...")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(1000)
+        if not is_cloudflare_challenge(page):
+            # The challenge redirects to the real page; let it settle
+            page.wait_for_load_state("domcontentloaded")
+            logger.info("Cloudflare challenge cleared")
+            return True
+    logger.warning(
+        f"Cloudflare challenge still showing after {timeout:.0f}s "
+        "(headless browsers and stealth patches both fail it - check the "
+        "headless and stealth settings)"
+    )
+    return False
 
 
 def apply_stealth(page: Page) -> None:

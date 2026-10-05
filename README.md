@@ -63,7 +63,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
 # Install Playwright browsers
-uv run playwright install chromium
+uv run patchright install chromium
 ```
 
 ## Usage
@@ -225,8 +225,9 @@ Edit `config.yaml` to configure brands, categories, and catalog URLs:
 # Global settings
 download_dir: ./downloads
 browser: chromium       # chromium, firefox, or webkit
-headless: false         # Run without visible window (manual captcha needs false)
-stealth: true           # Apply stealth patches
+headless: false         # Run without visible window (manualslib and manual captcha need false:
+                        # headless browsers never pass Cloudflare's managed challenge)
+stealth: false          # Stealth JS patches - keep off; Cloudflare's managed challenge detects them
 use_proxy: true         # Use proxy (requires PROXY_* in .env)
 delay_min: 0            # Min delay between requests (seconds)
 delay_max: 0            # Max delay between requests (seconds)

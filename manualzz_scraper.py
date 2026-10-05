@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 import yaml
-from playwright.sync_api import sync_playwright, Page
+from patchright.sync_api import sync_playwright, Page
 
 import database
 from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth

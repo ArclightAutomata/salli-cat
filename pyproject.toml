@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv",
     "internetarchive",
     "pikepdf>=10.1.0",
+    "patchright>=1.63.0",
 ]
 
 [project.scripts]

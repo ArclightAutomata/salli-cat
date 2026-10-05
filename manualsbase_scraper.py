@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, Page
+from patchright.sync_api import sync_playwright, Page
 
 load_dotenv()
 

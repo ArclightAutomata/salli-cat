@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, Page
+from patchright.sync_api import sync_playwright, Page
 
 from pdf_utils import strip_manualslib_watermark
 
@@ -22,7 +22,7 @@ from pdf_utils import strip_manualslib_watermark
 load_dotenv()
 
 import database
-from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user
+from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user, wait_for_cloudflare
 from captcha_solver import TwoCaptchaSolver, extract_sitekey_from_page, inject_captcha_response
 
 logging.basicConfig(
@@ -107,6 +107,17 @@ def extract_model_id(url: str) -> str | None:
     """Extract the model ID from a product URL like /products/Rca-35v432t-328381.html"""
     match = re.search(r'-(\d+)\.html', url)
     return match.group(1) if match else None
+
+
+class CloudflareChallengeError(Exception):
+    """Raised when a page stays behind Cloudflare's challenge interstitial."""
+
+
+def navigate(page: Page, url: str) -> None:
+    """Go to a manualslib URL and wait out Cloudflare's challenge if it appears."""
+    page.goto(url, wait_until="domcontentloaded")
+    if not wait_for_cloudflare(page):
+        raise CloudflareChallengeError(f"Cloudflare challenge not passed for {url}")
 
 
 def check_archive_org(manualslib_id: str) -> tuple[bool, str]:
@@ -255,7 +266,7 @@ def discover_brands(page: Page) -> tuple[list[dict], set[str]]:
 
     # First, get all the letter/number index links
     logger.info("Discovering brands with TV category...")
-    page.goto(f"{BASE_URL}/brand/", wait_until="domcontentloaded")
+    navigate(page, f"{BASE_URL}/brand/")
     random_delay(1, 2)
 
     # Find all index links in the bmap div
@@ -276,7 +287,7 @@ def discover_brands(page: Page) -> tuple[list[dict], set[str]]:
 
         while current_url:
             logger.info(f"Scanning: {current_url} (page {page_num})")
-            page.goto(current_url, wait_until="domcontentloaded")
+            navigate(page, current_url)
             random_delay(1, 2)
 
             # Find all brand rows
@@ -395,7 +406,7 @@ def scrape_category_listing(page: Page, brand: str, category_url: str, category_
 
     while current_url:
         logger.info(f"Scraping {brand} [{cat_display}] page {page_num}: {current_url}")
-        page.goto(current_url, wait_until="domcontentloaded")
+        navigate(page, current_url)
         random_delay(1, 2)
 
         # Find all model rows
@@ -656,7 +667,7 @@ def download_manual(page: Page, manual: dict, download_dir: Path, brand: str, ca
     """
     logger.info(f"Downloading: {manual['model']} - {manual['url']}")
 
-    page.goto(manual["url"], wait_until="domcontentloaded")
+    navigate(page, manual["url"])
     random_delay(1, 2)
 
     # Look for download button
@@ -1003,6 +1014,11 @@ def main():
     browser_type = get_config(config, "browser", "chromium")
     headless = get_config(config, "headless", False)
     use_stealth = get_config(config, "stealth", False)
+    if use_stealth:
+        # Cloudflare's managed challenge on manualslib detects the stealth JS
+        # patches and never clears; patchright already hides automation.
+        logger.warning("Ignoring stealth: true - stealth patches break manualslib's Cloudflare challenge")
+        use_stealth = False
     use_proxy = get_config(config, "use_proxy", False)
     extension_path = get_extension_path(config, project_dir)
 

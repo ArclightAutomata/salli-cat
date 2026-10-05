@@ -11,8 +11,11 @@ browser: chromium
 # Note: Manual captcha solving requires headless: false
 headless: false
 
-# Enable stealth mode to avoid fingerprint detection
-stealth: true
+# Stealth mode (playwright-stealth JS patches). Leave off: the browser is
+# launched via patchright, which hides automation at the CDP level, and the
+# stealth patches are themselves detected by Cloudflare's managed challenge
+# (manualslib never gets past "Just a moment..." with them on).
+stealth: false
 
 # Use proxy for browser (requires PROXY_* vars in .env)
 use_proxy: false
@@ -58,10 +61,13 @@ manualslib:
     - tv-dvd-combo
     - tv-vcr-combo
   # Override global settings for this scraper:
-  use_proxy: false
+  use_proxy: true
   # browser: firefox
   # stealth: false
-  headless: true
+  # Must stay headful: manualslib sits behind a Cloudflare managed challenge
+  # that headless browsers can never pass (patchright clears it automatically
+  # in a visible window).
+  headless: false
 
 # ManualsBase settings
 manualsbase:
