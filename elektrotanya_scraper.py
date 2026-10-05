@@ -2,16 +2,21 @@
 """Scraper for elektrotanya.com service manuals.
 
 Unlike the ManualsLib/ManualsBase/Manualzz scrapers, elektrotanya serves plain
-HTML with no Cloudflare challenge or captcha on the search and download paths,
-so this scraper uses stdlib urllib rather than Playwright.
+HTML with no Cloudflare challenge, so this scraper uses stdlib urllib rather
+than Playwright. Download pages are gated by a reCAPTCHA v2 form (added 2026);
+with elektrotanya's agreement we solve it through the shared 2captcha client
+(TWOCAPTCHA_API_KEY in .env), the same way the ManualsBase scraper does.
 
 Flow:
   1. Index: GET /showresult?what=<query>&kategoria=<cat>&kat2=all
      Each result row is
        <a href="/<slug>/download.html" title="[<Category> - <DocType>]: <desc>">
      We record one row per result (manual_url = the absolute download-page URL).
-  2. Download: fetch the download page, regex out the JS-built form's `fid` and
-     `file`, then GET /cgi-bin/download2.cgi?dk=&fid=<fid>&file=<file> with a
+  2. Download: fetch the download page. If it shows the reCAPTCHA form
+     (hidden `ckey` + a grecaptcha sitekey), solve it via 2captcha and POST
+     ckey + g-recaptcha-response back to the page; the response carries the
+     JS-built form. Regex out its `fid`, `file` and one-time `dk` token, then
+     GET /cgi-bin/download2.cgi?dk=<dk>&fid=<fid>&file=<file> with a
      Referer header. The site allows 10 files/day per IP; when the limit is hit
      download2.cgi returns an HTML page instead of a PDF, which we detect and
      stop on.
@@ -24,6 +29,7 @@ Config (config.yaml, namespace `elektrotanya`, all optional):
 """
 
 import argparse
+import os
 import hashlib
 import html
 import http.cookiejar
@@ -36,8 +42,12 @@ import urllib.request
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 import database
+from captcha_solver import TwoCaptchaSolver
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +72,14 @@ ROW_RE = re.compile(
 # The download page builds its form in JS: fid + file live in hidden inputs.
 FID_RE = re.compile(r"name=\\?[\"']fid\\?[\"']\s+value=\\?[\"'](\d+)\\?[\"']")
 FILE_RE = re.compile(r"name=\\?[\"']file\\?[\"']\s+value=\\?[\"']([^\"'\\]+)")
+# Since the 2026 reCAPTCHA gate the unlocked form also carries a one-time dk
+# token; download2.cgi answers "Client error!" without it.
+DK_RE = re.compile(r"name=\\?[\"']dk\\?[\"']\s+value=\\?[\"']([^\"'\\]*)")
+
+# The reCAPTCHA gate on download pages: a hidden ckey input and the sitekey
+# passed to grecaptcha.render().
+CKEY_RE = re.compile(r"name=['\"]ckey['\"]\s+value=['\"]([^'\"]+)['\"]")
+SITEKEY_RE = re.compile(r'"sitekey"\s*:\s*"([^"]+)"')
 
 DELAY_MIN = 2.0
 DELAY_MAX = 5.0
@@ -93,6 +111,33 @@ def random_delay(min_sec: float = None, max_sec: float = None):
 # so get_download_info() and the subsequent cgi GET must share one cookie jar.
 _COOKIE_JAR = http.cookiejar.CookieJar()
 _OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
+
+
+_captcha_solver: TwoCaptchaSolver | None = None
+
+
+def get_captcha_solver() -> TwoCaptchaSolver | None:
+    """The shared 2captcha client, or None when TWOCAPTCHA_API_KEY is unset."""
+    global _captcha_solver
+    if _captcha_solver is None and os.environ.get("TWOCAPTCHA_API_KEY"):
+        _captcha_solver = TwoCaptchaSolver(os.environ["TWOCAPTCHA_API_KEY"])
+    return _captcha_solver
+
+
+def _http_post(url: str, fields: dict, referer: str = None, timeout: int = 30) -> tuple[bytes, str]:
+    """POST form fields through the shared cookie jar. Returns (body_bytes, content_type)."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": BASE_URL,
+    }
+    if referer:
+        headers["Referer"] = referer
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with _OPENER.open(req, timeout=timeout) as resp:
+        return resp.read(), resp.headers.get("Content-Type", "")
 
 
 def _http_get(url: str, referer: str = None, timeout: int = 30) -> tuple[bytes, str]:
@@ -172,8 +217,8 @@ def search(query: str, kategoria: str = "tv") -> list[dict]:
     return results
 
 
-def get_download_info(download_page_url: str) -> tuple[str, str] | None:
-    """Fetch a download page and pull (fid, filename) from its JS form."""
+def get_download_info(download_page_url: str) -> tuple[str, str, str] | None:
+    """Fetch a download page and pull (fid, filename, dk) from its JS form."""
     try:
         body, _ = _http_get(download_page_url)
     except Exception as e:  # noqa: BLE001
@@ -182,10 +227,48 @@ def get_download_info(download_page_url: str) -> tuple[str, str] | None:
     text = body.decode("utf-8", errors="replace")
     fid = FID_RE.search(text)
     fname = FILE_RE.search(text)
+    if not (fid and fname):
+        text = _pass_captcha(download_page_url, text)
+        if text is None:
+            return None
+        fid = FID_RE.search(text)
+        fname = FILE_RE.search(text)
     if not fid or not fname:
         logger.warning("no fid/file on %s", download_page_url)
         return None
-    return fid.group(1), fname.group(1)
+    dk = DK_RE.search(text)
+    return fid.group(1), fname.group(1), (dk.group(1) if dk else "")
+
+
+def _pass_captcha(download_page_url: str, text: str) -> str | None:
+    """Solve the page's reCAPTCHA gate via 2captcha and return the unlocked page.
+
+    Returns None when the page has no recognisable gate, no solver is
+    configured, or the solve/submit fails.
+    """
+    ckey = CKEY_RE.search(text)
+    sitekey = SITEKEY_RE.search(text)
+    if not ckey or not sitekey:
+        return None
+    solver = get_captcha_solver()
+    if solver is None:
+        logger.warning("reCAPTCHA on %s but TWOCAPTCHA_API_KEY is not set", download_page_url)
+        return None
+    logger.info("solving reCAPTCHA for %s via 2captcha", download_page_url)
+    token = solver.solve_recaptcha(sitekey.group(1), download_page_url)
+    if not token:
+        logger.warning("2captcha returned no token for %s", download_page_url)
+        return None
+    try:
+        body, _ = _http_post(
+            download_page_url,
+            {"ckey": ckey.group(1), "g-recaptcha-response": token},
+            referer=download_page_url,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("captcha submit failed %s: %s", download_page_url, e)
+        return None
+    return body.decode("utf-8", errors="replace")
 
 
 def index(queries: list[str], categories: list[str]) -> int:
@@ -221,11 +304,11 @@ def download_manual(manual: dict, download_dir: Path) -> bool:
     info = get_download_info(manual["manual_url"])
     if not info:
         return False
-    fid, filename = info
+    fid, filename, dk = info
     random_delay()
 
     dl_url = f"{BASE_URL}/cgi-bin/download2.cgi?" + urllib.parse.urlencode(
-        {"dk": "", "fid": fid, "file": filename}
+        {"dk": dk, "fid": fid, "file": filename}
     )
     try:
         data, content_type = _http_get(dl_url, referer=manual["manual_url"], timeout=120)
