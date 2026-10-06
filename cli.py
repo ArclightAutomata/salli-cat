@@ -32,7 +32,7 @@ def scrape():
 @click.option("--discover-brands", is_flag=True, help="Discover all brands with TV category")
 @click.option("--use-discovered", is_flag=True, help="Scrape all discovered brands")
 @click.option("--index-only", is_flag=True, help="Only build index, don't download")
-@click.option("--download-only", is_flag=True, help="Only download pending manuals")
+@click.option("--download-only", is_flag=True, help="Only download pending manuals (all brands with pending manuals unless --brand(s) given)")
 @click.option("--limit", type=int, help="Limit number of downloads")
 @click.option("--clear", is_flag=True, help="Clear all manual records before scraping")
 @click.option("--clear-brands", is_flag=True, help="Clear all discovered brands")

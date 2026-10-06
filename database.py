@@ -759,6 +759,18 @@ def get_all_manuals(brand: str = None, downloaded: bool = None, source: str = No
     return [dict(row) for row in rows]
 
 
+def get_brands_with_pending(source: str = "manualslib") -> list[str]:
+    """Brands that still have manuals to download (not downloaded, not archived)."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT brand, COUNT(*) AS n FROM manuals
+        WHERE source = ? AND downloaded = 0 AND archived = 0
+        GROUP BY brand ORDER BY n DESC
+    """, (source,)).fetchall()
+    conn.close()
+    return [row["brand"] for row in rows]
+
+
 def get_undownloaded_manuals(brand: str = None, include_archived: bool = False, source: str = None) -> list[dict]:
     """Get manuals that haven't been downloaded. By default excludes archived manuals."""
     conn = get_connection()

@@ -1133,7 +1133,11 @@ def main():
                 use_discovered_urls = False
 
             if args.download_only:
-                # Only download pending manuals
+                # Only download pending manuals. With no brand given, work
+                # through every brand that has any, not just the configured ones
+                if not args.brands:
+                    brands = database.get_brands_with_pending()
+                    logger.info(f"Downloading pending manuals for all brands: {', '.join(brands)}")
                 failures = DownloadFailureTracker(rotate_page)
                 for brand in brands:
                     page = download_pending(page, brand, download_dir, captcha_solver, failures)
