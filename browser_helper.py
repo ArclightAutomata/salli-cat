@@ -4,6 +4,9 @@
 import logging
 import os
 import secrets
+import atexit
+import shutil
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -126,6 +129,49 @@ AD_PATTERNS = [
 ]
 
 
+VIRTUAL_DISPLAY_SIZE = "1920x1080x24"
+_virtual_display: str | None = None
+
+
+def start_virtual_display() -> str | None:
+    """
+    Start an Xvfb server for this process (once) and return its DISPLAY string.
+
+    A headful browser on a virtual display is indistinguishable from one on the
+    real desktop to the sites it visits (Cloudflare's managed challenge needs a
+    headful browser), but nothing appears on screen and no window steals focus.
+    Returns None if Xvfb isn't installed.
+    """
+    global _virtual_display
+    if _virtual_display:
+        return _virtual_display
+    if not shutil.which("Xvfb"):
+        logger.warning("Xvfb not found (apt install xvfb) - browser will use the real display")
+        return None
+
+    # Pick a display number that no X server is using
+    for num in range(90, 200):
+        if Path(f"/tmp/.X{num}-lock").exists() or Path(f"/tmp/.X11-unix/X{num}").exists():
+            continue
+        display = f":{num}"
+        proc = subprocess.Popen(
+            ["Xvfb", display, "-screen", "0", VIRTUAL_DISPLAY_SIZE, "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        # Wait for the server socket; if it exits, the number was taken after all
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and proc.poll() is None:
+            if Path(f"/tmp/.X11-unix/X{num}").exists():
+                atexit.register(proc.terminate)
+                _virtual_display = display
+                logger.info(f"Started virtual display {display} ({VIRTUAL_DISPLAY_SIZE})")
+                return display
+            time.sleep(0.1)
+        proc.terminate()
+    logger.warning("Could not start Xvfb - browser will use the real display")
+    return None
+
+
 def launch_browser_with_extension(
     playwright: Playwright,
     extension_path: Path | str | None = None,
@@ -135,6 +181,7 @@ def launch_browser_with_extension(
     user_agent: str = None,
     use_proxy: bool = True,
     browser: str = "chromium",
+    virtual_display: bool = False,
 ) -> BrowserContext:
     """
     Launch a browser with optional extension and proxy support.
@@ -154,6 +201,8 @@ def launch_browser_with_extension(
             red flag for Cloudflare, so only set this deliberately.
         use_proxy: If True, use Bright Data Web Unlocker proxy if configured
         browser: Browser to use - "chromium", "firefox", or "webkit"
+        virtual_display: Run a headful browser on an Xvfb virtual display so it
+            stays off the real desktop (ignored when headless)
 
     Returns:
         BrowserContext
@@ -201,10 +250,22 @@ def launch_browser_with_extension(
     if proxy:
         logger.info(f"Browser using proxy: {proxy['server']}")
 
+    # Only the browser process gets pointed at the virtual display
+    env = None
+    if virtual_display and not headless:
+        display = start_virtual_display()
+        if display:
+            env = {k: v for k, v in os.environ.items() if k != "WAYLAND_DISPLAY"}
+            env["DISPLAY"] = display
+            if browser == "chromium":
+                # No window manager on Xvfb to size the window - do it ourselves
+                browser_args.append("--window-size=1920,1080")
+
     # Launch persistent context
     context = browser_type.launch_persistent_context(
         user_data_dir=str(user_data_dir),
         headless=headless,
+        env=env,
         args=browser_args if browser == "chromium" else [],
         viewport=viewport,
         no_viewport=viewport is None,

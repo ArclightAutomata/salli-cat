@@ -697,6 +697,7 @@ def main():
     # Get browser settings from config (with namespace override support)
     browser_type = get_config(config, "browser", "chromium")
     headless = get_config(config, "headless", False)
+    virtual_display = get_config(config, "virtual_display", False)
     use_stealth = get_config(config, "stealth", False)
     use_proxy = get_config(config, "use_proxy", False)
 
@@ -711,6 +712,7 @@ def main():
             headless=headless,
             browser=browser_type,
             use_proxy=use_proxy,
+            virtual_display=virtual_display,
         )
 
         if context.pages:

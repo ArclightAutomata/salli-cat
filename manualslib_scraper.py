@@ -1013,6 +1013,7 @@ def main():
     project_dir = Path(__file__).parent
     browser_type = get_config(config, "browser", "chromium")
     headless = get_config(config, "headless", False)
+    virtual_display = get_config(config, "virtual_display", False)
     use_stealth = get_config(config, "stealth", False)
     if use_stealth:
         # Cloudflare's managed challenge on manualslib detects the stealth JS
@@ -1056,6 +1057,7 @@ def main():
                 headless=headless,
                 browser=browser_type,
                 use_proxy=use_proxy,
+                virtual_display=virtual_display,
             )
 
             # Persistent context may already have pages open, use the first one or create new

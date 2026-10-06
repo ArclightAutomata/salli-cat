@@ -668,7 +668,7 @@ def download_manual(page: Page, manual: dict, download_dir: Path) -> tuple[str, 
     return None
 
 
-def scrape_manualzz(catalog_urls: list[str], download_dir: Path, download: bool = True, extension_path: Path = None, browser: str = "chromium", headless: bool = False, use_stealth: bool = False, use_proxy: bool = False):
+def scrape_manualzz(catalog_urls: list[str], download_dir: Path, download: bool = True, extension_path: Path = None, browser: str = "chromium", headless: bool = False, use_stealth: bool = False, use_proxy: bool = False, virtual_display: bool = False):
     """Main scraping function for manualzz."""
     database.init_db()
 
@@ -680,6 +680,7 @@ def scrape_manualzz(catalog_urls: list[str], download_dir: Path, download: bool 
             headless=headless,
             browser=browser,
             use_proxy=use_proxy,
+            virtual_display=virtual_display,
         )
 
         # Persistent context may already have pages open, use the first one or create new
@@ -788,6 +789,7 @@ def main():
     # Get browser settings from config (with namespace override support)
     browser_type = get_config(config, "browser", "chromium")
     headless = get_config(config, "headless", False)
+    virtual_display = get_config(config, "virtual_display", False)
     use_stealth = get_config(config, "stealth", False)
     use_proxy = get_config(config, "use_proxy", False)
 
@@ -801,6 +803,7 @@ def main():
                 headless=headless,
                 browser=browser_type,
                 use_proxy=use_proxy,
+                virtual_display=virtual_display,
             )
 
             # Persistent context may already have pages open
@@ -842,7 +845,7 @@ def main():
             finally:
                 context.close()
     else:
-        scrape_manualzz(catalog_urls, download_dir, download=not args.index_only, extension_path=extension_path, browser=browser_type, headless=headless, use_stealth=use_stealth, use_proxy=use_proxy)
+        scrape_manualzz(catalog_urls, download_dir, download=not args.index_only, extension_path=extension_path, browser=browser_type, headless=headless, use_stealth=use_stealth, use_proxy=use_proxy, virtual_display=virtual_display)
 
 
 if __name__ == "__main__":

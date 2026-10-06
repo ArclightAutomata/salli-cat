@@ -228,6 +228,8 @@ browser: chromium       # chromium, firefox, or webkit
 headless: false         # Run without visible window (manualslib and manual captcha need false:
                         # headless browsers never pass Cloudflare's managed challenge)
 stealth: false          # Stealth JS patches - keep off; Cloudflare's managed challenge detects them
+virtual_display: true   # Run the headful browser on an Xvfb display (needs `apt install xvfb`):
+                        # invisible and never steals focus, yet passes Cloudflare like a real window
 use_proxy: true         # Use proxy (requires PROXY_* in .env)
 delay_min: 0            # Min delay between requests (seconds)
 delay_max: 0            # Max delay between requests (seconds)

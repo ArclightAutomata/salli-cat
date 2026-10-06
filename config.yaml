@@ -11,6 +11,12 @@ browser: chromium
 # Note: Manual captcha solving requires headless: false
 headless: false
 
+# Run a headful browser on an Xvfb virtual display: it never appears on the
+# desktop or steals focus, while sites (Cloudflare) still see a normal headful
+# browser. Needs `apt install xvfb`. Manual captcha solving is impossible on a
+# virtual display, so keep 2captcha configured.
+virtual_display: true
+
 # Stealth mode (playwright-stealth JS patches). Leave off: the browser is
 # launched via patchright, which hides automation at the CDP level, and the
 # stealth patches are themselves detected by Cloudflare's managed challenge
