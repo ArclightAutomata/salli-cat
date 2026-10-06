@@ -3,6 +3,7 @@
 
 import logging
 import os
+import random
 import secrets
 import atexit
 import shutil
@@ -326,6 +327,36 @@ def _page_state(page: Page) -> tuple[str, str] | None:
     return title, ready
 
 
+def _click_turnstile_checkbox(page: Page) -> bool:
+    """
+    Click the "Verify you are human" checkbox of an interactive challenge.
+
+    For IPs it trusts less (proxy exits), Cloudflare swaps the invisible check
+    for a Turnstile checkbox that waits for a click. The widget lives in a
+    cross-origin iframe inside a closed shadow root, so it is clicked by
+    position: the box sits ~28px in from the widget's left edge. Because the
+    browser itself is undetected (patchright), a real mouse click is accepted.
+    Returns False if no Turnstile widget is on the page.
+    """
+    frame = next((f for f in page.frames if "challenges.cloudflare.com" in f.url), None)
+    if not frame:
+        return False
+    try:
+        box = frame.frame_element().bounding_box()
+    except Exception:
+        return False
+    if not box:
+        return False
+    x = box["x"] + 28 + random.uniform(-3, 3)
+    y = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+    page.mouse.move(x - 120, y + 60)
+    page.wait_for_timeout(250)
+    page.mouse.move(x, y, steps=15)
+    page.wait_for_timeout(200)
+    page.mouse.click(x, y)
+    return True
+
+
 def is_cloudflare_challenge(page: Page) -> bool:
     """True if the page is currently showing Cloudflare's challenge interstitial."""
     state = _page_state(page)
@@ -337,8 +368,9 @@ def wait_for_cloudflare(page: Page, timeout: float = 60.0, load_timeout: float =
     Wait for a Cloudflare managed challenge ("Just a moment...") to clear and
     for the real page behind it to load.
 
-    patchright passes the challenge on its own within seconds in a headful
-    browser (headless browsers never pass it). Passing triggers a navigation to
+    patchright passes the invisible challenge on its own within seconds in a
+    headful browser (headless browsers never pass it). When Cloudflare shows
+    the interactive checkbox instead, we click it. Passing triggers a navigation to
     the real page, which can take a while through a proxy, so after the
     interstitial disappears we keep waiting until the new document has been
     parsed - querying it any earlier fails with "execution context destroyed".
@@ -349,6 +381,8 @@ def wait_for_cloudflare(page: Page, timeout: float = 60.0, load_timeout: float =
         return True
     logger.info("Cloudflare challenge detected, waiting for it to clear...")
     deadline = time.monotonic() + timeout
+    # Give the invisible check a few seconds before treating it as interactive
+    next_click = time.monotonic() + 6
     while True:
         page.wait_for_timeout(500)
         state = _page_state(page)
@@ -356,11 +390,15 @@ def wait_for_cloudflare(page: Page, timeout: float = 60.0, load_timeout: float =
             break
         if time.monotonic() > deadline:
             logger.warning(
-                f"Cloudflare challenge still showing after {timeout:.0f}s "
-                "(headless browsers and stealth patches both fail it - check the "
-                "headless and stealth settings)"
+                f"Cloudflare challenge still showing after {timeout:.0f}s, even after "
+                "clicking the checkbox (headless browsers and stealth patches both "
+                "fail it - check the headless and stealth settings)"
             )
             return False
+        if state and time.monotonic() >= next_click:
+            if _click_turnstile_checkbox(page):
+                logger.info("Clicked Cloudflare's \"Verify you are human\" checkbox")
+            next_click = time.monotonic() + 10
 
     # Challenge gone: now wait for the real page to be parsed
     deadline = time.monotonic() + load_timeout
