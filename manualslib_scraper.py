@@ -109,6 +109,16 @@ def extract_model_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+class ManualUnavailableError(Exception):
+    """The site no longer has the file (its PDF link 404s) - not an IP or session problem."""
+
+
+# manualslib_ids whose file turned out to be gone during this run, so the
+# other models listed under the same document aren't each tried (and a
+# captcha solved) just to hit the same dead link.
+_unavailable_ids: set[str] = set()
+
+
 class CloudflareChallengeError(Exception):
     """Raised when a page stays behind Cloudflare's challenge interstitial."""
 
@@ -623,6 +633,11 @@ def download_file_to_temp(url: str, use_proxy: bool = False) -> tuple[Path, str]
 
         return temp_path, original_filename
 
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ManualUnavailableError(f"PDF link is dead (404): {url}") from e
+        logger.error(f"Failed to download {url}: {e}")
+        return None
     except Exception as e:
         logger.error(f"Failed to download {url}: {e}")
         return None
@@ -822,6 +837,10 @@ def download_pending(page: Page, brand: str, download_dir: Path, captcha_solver,
                 if manualslib_id:
                     database.update_manualslib_id(manual_record["id"], manualslib_id)
 
+            if manualslib_id and str(manualslib_id) in _unavailable_ids:
+                logger.info(f"Skipping {manual_record['model']}: document {manualslib_id} is unavailable on manualslib")
+                continue
+
             # Check if already archived on archive.org
             if manualslib_id:
                 logger.info(f"Checking archive.org for {manual_record['model']} (ID: {manualslib_id})...")
@@ -852,6 +871,13 @@ def download_pending(page: Page, brand: str, download_dir: Path, captcha_solver,
             random_delay()
         except (DownloadCircuitBreakerError, DownloadLimitReached):
             raise  # Re-raise to stop
+        except ManualUnavailableError as e:
+            # The file is gone on manualslib's side. The browser session is
+            # fine, so don't count it against the breaker or rotate away a
+            # session that has already passed Cloudflare.
+            logger.warning(f"Skipping {manual_record['model']}: {e}")
+            if manualslib_id:
+                _unavailable_ids.add(str(manualslib_id))
         except Exception as e:
             logger.error(f"Error downloading {manual_record['model']}: {e}")
             page = failures.failure(page)
