@@ -285,39 +285,64 @@ def launch_browser_with_extension(
 CLOUDFLARE_CHALLENGE_TITLE = "just a moment"
 
 
+def _page_state(page: Page) -> tuple[str, str] | None:
+    """(title, readyState) of the current document, or None mid-navigation."""
+    try:
+        title = page.title()
+        ready = page.evaluate("document.readyState")
+    except Exception:
+        # Both calls throw while the document is being replaced by a navigation
+        return None
+    if not title:
+        return None
+    return title, ready
+
+
 def is_cloudflare_challenge(page: Page) -> bool:
     """True if the page is currently showing Cloudflare's challenge interstitial."""
-    try:
-        return CLOUDFLARE_CHALLENGE_TITLE in page.title().lower()
-    except Exception:
-        # Title lookup races with the redirect that follows a passed challenge
-        return False
+    state = _page_state(page)
+    return bool(state) and CLOUDFLARE_CHALLENGE_TITLE in state[0].lower()
 
 
-def wait_for_cloudflare(page: Page, timeout: float = 45.0) -> bool:
+def wait_for_cloudflare(page: Page, timeout: float = 60.0, load_timeout: float = 60.0) -> bool:
     """
-    Wait for a Cloudflare managed challenge ("Just a moment...") to clear.
+    Wait for a Cloudflare managed challenge ("Just a moment...") to clear and
+    for the real page behind it to load.
 
-    patchright passes the challenge on its own within a few seconds in a headful
-    browser; headless browsers never pass it. Returns False if the challenge is
-    still up after `timeout` seconds.
+    patchright passes the challenge on its own within seconds in a headful
+    browser (headless browsers never pass it). Passing triggers a navigation to
+    the real page, which can take a while through a proxy, so after the
+    interstitial disappears we keep waiting until the new document has been
+    parsed - querying it any earlier fails with "execution context destroyed".
+
+    Returns False if the challenge is still up after `timeout` seconds.
     """
     if not is_cloudflare_challenge(page):
         return True
     logger.info("Cloudflare challenge detected, waiting for it to clear...")
     deadline = time.monotonic() + timeout
+    while True:
+        page.wait_for_timeout(500)
+        state = _page_state(page)
+        if state and CLOUDFLARE_CHALLENGE_TITLE not in state[0].lower():
+            break
+        if time.monotonic() > deadline:
+            logger.warning(
+                f"Cloudflare challenge still showing after {timeout:.0f}s "
+                "(headless browsers and stealth patches both fail it - check the "
+                "headless and stealth settings)"
+            )
+            return False
+
+    # Challenge gone: now wait for the real page to be parsed
+    deadline = time.monotonic() + load_timeout
     while time.monotonic() < deadline:
-        page.wait_for_timeout(1000)
-        if not is_cloudflare_challenge(page):
-            # The challenge redirects to the real page; let it settle
-            page.wait_for_load_state("domcontentloaded")
+        state = _page_state(page)
+        if state and state[1] in ("interactive", "complete") and CLOUDFLARE_CHALLENGE_TITLE not in state[0].lower():
             logger.info("Cloudflare challenge cleared")
             return True
-    logger.warning(
-        f"Cloudflare challenge still showing after {timeout:.0f}s "
-        "(headless browsers and stealth patches both fail it - check the "
-        "headless and stealth settings)"
-    )
+        page.wait_for_timeout(500)
+    logger.warning(f"Page did not finish loading within {load_timeout:.0f}s after the Cloudflare challenge")
     return False
 
 
