@@ -52,6 +52,8 @@ elektrotanya:
   # limit is enforced on the file endpoint, so files go through the proxy too.
   daily_limit: 10
   use_proxy: true
+  # Also index https://elektrotanya.com/show_servicemodes (~700 service-mode docs)
+  servicemodes: true
   # Politeness (elektrotanya is a small community site — don't hammer it).
   delay_min: 3
   delay_max: 7

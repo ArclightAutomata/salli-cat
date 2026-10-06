@@ -23,6 +23,9 @@ Flow:
      and we rotate to a fresh exit IP every `daily_limit` downloads - and
      whenever the limit page shows up anyway. Without a proxy the run stops
      at the limit.
+  3. Service modes: /show_servicemodes is one page listing ~700 service-mode /
+     service-menu documents grouped by brand; indexed too when `servicemodes`
+     is on.
 
 Config (config.yaml, namespace `elektrotanya`, all optional):
   queries:      list of free-text search terms (max 30 chars each; elektrotanya
@@ -32,6 +35,7 @@ Config (config.yaml, namespace `elektrotanya`, all optional):
                 the run; with one it sets the rotation cadence.
   use_proxy:    route every request through PROXY_URL (see .env.example); with
                 a {session} placeholder the exit IP rotates.
+  servicemodes: also index /show_servicemodes (default true).
 """
 
 import argparse
@@ -87,6 +91,11 @@ DK_RE = re.compile(r"name=\\?[\"']dk\\?[\"']\s+value=\\?[\"']([^\"'\\]*)")
 # passed to grecaptcha.render().
 CKEY_RE = re.compile(r"name=['\"]ckey['\"]\s+value=['\"]([^'\"]+)['\"]")
 SITEKEY_RE = re.compile(r'"sitekey"\s*:\s*"([^"]+)"')
+
+SERVICEMODES_URL = f"{BASE_URL}/show_servicemodes"
+# The service-modes page is one table: brand header rows (<b>brand</b>)
+# followed by one link row per file, hrefs relative without a leading slash.
+SERVICEMODES_RE = re.compile(r"<b>([^<]+)</b>|<a href=\"/?([^\"/]+)/download\.html\"", re.IGNORECASE)
 
 # Give up after this many consecutive downloads hit the limit page on freshly
 # rotated IPs - at that point it isn't the per-IP limit.
@@ -225,7 +234,7 @@ def guess_brand(description: str) -> str:
 
 def clean_model(description: str) -> str:
     """Human-readable model/title: drop a trailing file extension."""
-    return re.sub(r"\.(pdf|djvu|zip|rar|jpg)$", "", description.strip(), flags=re.I)
+    return re.sub(r"\.[a-z0-9]{1,5}$", "", description.strip(), flags=re.I)
 
 
 def search(query: str, kategoria: str = "tv") -> list[dict]:
@@ -316,6 +325,52 @@ def _pass_captcha(download_page_url: str, text: str) -> str | None:
     return body.decode("utf-8", errors="replace")
 
 
+def parse_servicemodes(text: str) -> list[dict]:
+    """Rows for every file on the service-modes page, brand taken from the headers."""
+    rows, brand = [], "unknown"
+    for header, slug in SERVICEMODES_RE.findall(text):
+        if header:
+            brand = html.unescape(header).strip().lower() or brand
+            continue
+        slug = html.unescape(slug)
+        rows.append(
+            {
+                "manual_url": f"{BASE_URL}/{slug}/download.html",
+                "slug": slug,
+                "category": "TV",
+                "doc_type": "Service Mode",
+                "brand": brand,
+                "model": clean_model(slug).replace("_", " "),
+            }
+        )
+    return rows
+
+
+def index_servicemodes() -> int:
+    """Index the /show_servicemodes list. Returns new count."""
+    try:
+        body, _ = _http_get(SERVICEMODES_URL)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("service-modes page fetch failed: %s", e)
+        return 0
+    rows = parse_servicemodes(body.decode("utf-8", errors="replace"))
+    added = sum(1 for row in rows if _add_row(row))
+    logger.info("service modes: %d listed, %d new", len(rows), added)
+    return added
+
+
+def _add_row(row: dict) -> int | None:
+    return database.add_manual(
+        brand=row["brand"],
+        model=row["model"],
+        manual_url=row["manual_url"],
+        doc_type=row["doc_type"],
+        source=SOURCE,
+        source_id=row["slug"],
+        category=row["category"],
+    )
+
+
 def index(queries: list[str], categories: list[str]) -> int:
     """Search every query×category, add new rows to the DB. Returns new count."""
     added = 0
@@ -323,18 +378,7 @@ def index(queries: list[str], categories: list[str]) -> int:
         for query in queries:
             rows = search(query, kategoria)
             logger.info("search %r [%s]: %d results", query, kategoria, len(rows))
-            for row in rows:
-                manual_id = database.add_manual(
-                    brand=row["brand"],
-                    model=row["model"],
-                    manual_url=row["manual_url"],
-                    doc_type=row["doc_type"],
-                    source=SOURCE,
-                    source_id=row["slug"],
-                    category=row["category"],
-                )
-                if manual_id:
-                    added += 1
+            added += sum(1 for row in rows if _add_row(row))
             random_delay()
     logger.info("indexed %d new elektrotanya manuals", added)
     return added
@@ -371,12 +415,10 @@ def download_manual(manual: dict, download_dir: Path) -> bool:
             "likely the 10-files/day limit"
         )
 
-    ext = ".pdf"
-    low = filename.lower()
-    for cand in (".djvu", ".zip", ".rar", ".jpg"):
-        if low.endswith(cand):
-            ext = cand
-            break
+    # Keep the site's extension (pdf, djvu, zip, rar, txt, doc, hex, ...)
+    ext = Path(filename).suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,5}", ext):
+        ext = ".pdf" if data[:5] == b"%PDF-" else ".bin"
 
     sha1, md5 = compute_checksums_bytes(data)
     final_path = get_sha1_storage_path(download_dir, sha1, ext)
@@ -441,6 +483,8 @@ def main():
 
     if not args.download_only:
         index(queries, categories)
+        if get_config(config, "servicemodes", True):
+            index_servicemodes()
 
     if args.index_only:
         return
