@@ -60,6 +60,34 @@ def resolve_proxy_user(user: str) -> str:
     return user
 
 
+def get_proxy_url() -> str | None:
+    """
+    Get proxy URL from environment variables (for urllib requests).
+
+    PROXY_URL takes precedence over the individual PROXY_* variables.
+    A {session} placeholder in the username is replaced with a fresh session ID.
+    """
+    proxy_url = os.environ.get("PROXY_URL")
+    if proxy_url:
+        parsed = urllib.parse.urlsplit(proxy_url)
+        if parsed.username:
+            user = resolve_proxy_user(urllib.parse.unquote(parsed.username))
+            password = urllib.parse.unquote(parsed.password or "")
+            host_port = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+            return f"{parsed.scheme or 'http'}://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{host_port}"
+        return proxy_url
+
+    host = os.environ.get("PROXY_HOST")
+    port = os.environ.get("PROXY_PORT")
+    user = os.environ.get("PROXY_USER")
+    password = os.environ.get("PROXY_PASS")
+
+    if host and port and user and password:
+        user = resolve_proxy_user(user)
+        return f"http://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{host}:{port}"
+    return None
+
+
 def get_proxy_config() -> dict | None:
     """
     Get proxy config from environment variables.

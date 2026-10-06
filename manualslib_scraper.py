@@ -22,7 +22,7 @@ from pdf_utils import strip_manualslib_watermark
 load_dotenv()
 
 import database
-from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user, wait_for_cloudflare
+from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user, wait_for_cloudflare, get_proxy_url
 from captcha_solver import TwoCaptchaSolver, extract_sitekey_from_page, inject_captcha_response
 
 logging.basicConfig(
@@ -556,34 +556,6 @@ def wait_for_captcha_solved(page: Page, timeout: int = CAPTCHA_TIMEOUT, captcha_
 
     logger.warning("Captcha timeout - skipping this manual")
     return False
-
-
-def get_proxy_url() -> str | None:
-    """
-    Get proxy URL from environment variables (for urllib requests).
-
-    PROXY_URL takes precedence over the individual PROXY_* variables.
-    A {session} placeholder in the username is replaced with a fresh session ID.
-    """
-    proxy_url = os.environ.get("PROXY_URL")
-    if proxy_url:
-        parsed = urllib.parse.urlsplit(proxy_url)
-        if parsed.username:
-            user = resolve_proxy_user(urllib.parse.unquote(parsed.username))
-            password = urllib.parse.unquote(parsed.password or "")
-            host_port = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
-            return f"{parsed.scheme or 'http'}://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{host_port}"
-        return proxy_url
-
-    host = os.environ.get("PROXY_HOST")
-    port = os.environ.get("PROXY_PORT")
-    user = os.environ.get("PROXY_USER")
-    password = os.environ.get("PROXY_PASS")
-
-    if host and port and user and password:
-        user = resolve_proxy_user(user)
-        return f"http://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{host}:{port}"
-    return None
 
 
 def download_file_to_temp(url: str, use_proxy: bool = False) -> tuple[Path, str] | None:

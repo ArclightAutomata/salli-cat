@@ -17,15 +17,21 @@ Flow:
      ckey + g-recaptcha-response back to the page; the response carries the
      JS-built form. Regex out its `fid`, `file` and one-time `dk` token, then
      GET /cgi-bin/download2.cgi?dk=<dk>&fid=<fid>&file=<file> with a
-     Referer header. The site allows 10 files/day per IP; when the limit is hit
-     download2.cgi returns an HTML page instead of a PDF, which we detect and
-     stop on.
+     Referer header. The site allows 10 files/day per IP, enforced at
+     download2.cgi (a link fetched through one IP can't be downloaded from
+     another), so with `use_proxy` the whole exchange goes through the proxy
+     and we rotate to a fresh exit IP every `daily_limit` downloads - and
+     whenever the limit page shows up anyway. Without a proxy the run stops
+     at the limit.
 
 Config (config.yaml, namespace `elektrotanya`, all optional):
   queries:      list of free-text search terms (max 30 chars each; elektrotanya
                 caps the search box at 30). Defaults to the manualslib brand list.
   categories:   list of `kategoria` filter slugs (e.g. tv, monitor). Default ["tv"].
-  daily_limit:  max downloads per run (default 10, the site's free ceiling).
+  daily_limit:  the site's per-IP ceiling (default 10). Without a proxy it caps
+                the run; with one it sets the rotation cadence.
+  use_proxy:    route every request through PROXY_URL (see .env.example); with
+                a {session} placeholder the exit IP rotates.
 """
 
 import argparse
@@ -45,6 +51,7 @@ import yaml
 from dotenv import load_dotenv
 
 import database
+from browser_helper import get_proxy_url, proxy_supports_rotation
 from captcha_solver import TwoCaptchaSolver
 
 load_dotenv()
@@ -81,8 +88,13 @@ DK_RE = re.compile(r"name=\\?[\"']dk\\?[\"']\s+value=\\?[\"']([^\"'\\]*)")
 CKEY_RE = re.compile(r"name=['\"]ckey['\"]\s+value=['\"]([^'\"]+)['\"]")
 SITEKEY_RE = re.compile(r'"sitekey"\s*:\s*"([^"]+)"')
 
+# Give up after this many consecutive downloads hit the limit page on freshly
+# rotated IPs - at that point it isn't the per-IP limit.
+MAX_CONSECUTIVE_ROTATION_FAILURES = 5
+
 DELAY_MIN = 2.0
 DELAY_MAX = 5.0
+USE_PROXY = False
 
 
 def load_config() -> dict:
@@ -105,12 +117,45 @@ def random_delay(min_sec: float = None, max_sec: float = None):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
-# A cookie-aware opener shared across the run. The download endpoint
-# (/cgi-bin/download2.cgi) rejects requests that don't carry the session
-# cookies (_captchaq, _experience, be) set when the download page is fetched —
-# so get_download_info() and the subsequent cgi GET must share one cookie jar.
-_COOKIE_JAR = http.cookiejar.CookieJar()
-_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
+class HttpSession:
+    """
+    A cookie jar plus opener, optionally bound to one proxy exit IP.
+
+    The download endpoint (/cgi-bin/download2.cgi) rejects requests that don't
+    carry the session cookies (_captchaq, _experience, be) set when the download
+    page is fetched, and only serves files to the IP that fetched the page - so
+    get_download_info() and the subsequent cgi GET must share one session.
+    With a {session} placeholder in the proxy username each HttpSession gets
+    its own exit IP; `downloads` counts files pulled through it.
+    """
+
+    def __init__(self, use_proxy: bool):
+        self.jar = http.cookiejar.CookieJar()
+        handlers = [urllib.request.HTTPCookieProcessor(self.jar)]
+        self.proxy_url = get_proxy_url() if use_proxy else None
+        if use_proxy and not self.proxy_url:
+            logger.warning("use_proxy is on but no PROXY_URL/PROXY_* configured - connecting directly")
+        if self.proxy_url:
+            handlers.append(urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url}))
+        self.opener = urllib.request.build_opener(*handlers)
+        self.downloads = 0
+
+
+_session: HttpSession | None = None
+
+
+def get_session() -> HttpSession:
+    global _session
+    if _session is None:
+        _session = HttpSession(USE_PROXY)
+    return _session
+
+
+def new_session() -> HttpSession:
+    """Drop cookies and, with a rotating proxy, move to a fresh exit IP."""
+    global _session
+    _session = HttpSession(USE_PROXY)
+    return _session
 
 
 _captcha_solver: TwoCaptchaSolver | None = None
@@ -136,7 +181,7 @@ def _http_post(url: str, fields: dict, referer: str = None, timeout: int = 30) -
         headers["Referer"] = referer
     data = urllib.parse.urlencode(fields).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with _OPENER.open(req, timeout=timeout) as resp:
+    with get_session().opener.open(req, timeout=timeout) as resp:
         return resp.read(), resp.headers.get("Content-Type", "")
 
 
@@ -146,7 +191,7 @@ def _http_get(url: str, referer: str = None, timeout: int = 30) -> tuple[bytes, 
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    with _OPENER.open(req, timeout=timeout) as resp:
+    with get_session().opener.open(req, timeout=timeout) as resp:
         return resp.read(), resp.headers.get("Content-Type", "")
 
 
@@ -367,9 +412,15 @@ def main():
     database.init_db()
     config = load_config()
 
-    global DELAY_MIN, DELAY_MAX
+    global DELAY_MIN, DELAY_MAX, USE_PROXY
     DELAY_MIN = float(get_config(config, "delay_min", 2.0))
     DELAY_MAX = float(get_config(config, "delay_max", 5.0)) or DELAY_MIN
+    USE_PROXY = bool(get_config(config, "use_proxy", False))
+    rotate = USE_PROXY and proxy_supports_rotation()
+    if USE_PROXY:
+        logger.info("proxy enabled for all elektrotanya requests%s", " with IP rotation" if rotate else "")
+        if not rotate:
+            logger.info("Tip: put {session} in the proxy username to rotate past the per-IP daily limit")
 
     if args.clear:
         database.clear_manuals_by_source(SOURCE)
@@ -382,7 +433,9 @@ def main():
     ]
     queries = args.query or get_config(config, "queries", default_queries)
     categories = args.kategoria or get_config(config, "categories", ["tv"])
-    daily_limit = args.limit if args.limit is not None else int(get_config(config, "daily_limit", 10))
+    per_ip_limit = int(get_config(config, "daily_limit", 10))
+    # Without rotation the per-IP limit is the run limit; with it, only --limit caps the run
+    run_limit = args.limit if args.limit is not None else (None if rotate else per_ip_limit)
 
     download_dir = Path(get_config(config, "download_dir", "./downloads"))
 
@@ -393,18 +446,41 @@ def main():
         return
 
     pending = database.get_undownloaded_manuals(source=SOURCE)
-    logger.info("%d elektrotanya manuals pending download; run limit %d", len(pending), daily_limit)
+    logger.info("%d elektrotanya manuals pending download; run limit %s", len(pending),
+                run_limit if run_limit is not None else "none (rotating IPs)")
 
     done = 0
+    limit_hits = 0  # consecutive limit pages, each on a freshly rotated IP
+    stop = False
     for manual in pending:
-        if done >= daily_limit:
-            logger.info("hit run limit of %d downloads; stopping", daily_limit)
+        if run_limit is not None and done >= run_limit:
+            logger.info("hit run limit of %d downloads; stopping", run_limit)
             break
-        try:
-            if download_manual(manual, download_dir):
-                done += 1
-        except DailyLimitReached as e:
-            logger.warning("%s — stopping (try again tomorrow or use a proxy)", e)
+        if rotate and get_session().downloads >= per_ip_limit:
+            logger.info("%d downloads on this IP; rotating to a fresh one", per_ip_limit)
+            new_session()
+        # Retry the same manual on a new IP each time the limit page shows up
+        while True:
+            try:
+                if download_manual(manual, download_dir):
+                    done += 1
+                    limit_hits = 0
+                    get_session().downloads += 1
+                break
+            except DailyLimitReached as e:
+                if not rotate:
+                    logger.warning("%s — stopping (try again tomorrow or enable use_proxy)", e)
+                    stop = True
+                    break
+                limit_hits += 1
+                if limit_hits >= MAX_CONSECUTIVE_ROTATION_FAILURES:
+                    logger.error("%d consecutive limit pages on fresh IPs - not the per-IP limit; stopping", limit_hits)
+                    stop = True
+                    break
+                logger.warning("%s — rotating proxy IP and retrying (%d/%d)", e, limit_hits, MAX_CONSECUTIVE_ROTATION_FAILURES)
+                new_session()
+                random_delay()
+        if stop:
             break
         random_delay()
 

@@ -47,8 +47,11 @@ elektrotanya:
   categories:
     - tv
     - monitor
-  # Downloads per run — the site allows 10 files/day per IP without an account.
+  # The site allows 10 files/day per IP without an account. Without a proxy this
+  # caps the run; with use_proxy it's how often the exit IP is rotated. The
+  # limit is enforced on the file endpoint, so files go through the proxy too.
   daily_limit: 10
+  use_proxy: true
   # Politeness (elektrotanya is a small community site — don't hammer it).
   delay_min: 3
   delay_max: 7

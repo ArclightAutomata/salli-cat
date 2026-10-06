@@ -132,10 +132,10 @@ def scrape_manualzz(urls, index_only, download_only, clear):
 @click.option("--kategoria", multiple=True, help="Category filters, e.g. tv monitor (overrides config)")
 @click.option("--index-only", is_flag=True, help="Only build index, don't download")
 @click.option("--download-only", is_flag=True, help="Only download pending manuals")
-@click.option("--limit", type=int, help="Max downloads this run (default: 10, the site's daily cap)")
+@click.option("--limit", type=int, help="Max downloads this run (default: unlimited with a rotating proxy, else 10, the site's per-IP daily cap)")
 @click.option("--clear", is_flag=True, help="Clear all elektrotanya records")
 def scrape_elektrotanya(query, kategoria, index_only, download_only, limit, clear):
-    """Scrape service manuals from elektrotanya.com (10 files/day per IP)."""
+    """Scrape service manuals from elektrotanya.com (10 files/day per IP; rotates proxy IPs past it)."""
     import sys
 
     argv = []
