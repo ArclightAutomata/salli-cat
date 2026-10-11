@@ -834,7 +834,7 @@ def download_pending(page: Page, brand: str, download_dir: Path, captcha_solver,
     if reused or archived:
         logger.info(f"Resolved from sibling manuals: {reused} reuse an existing download, {archived} already archived")
 
-    pending = database.get_undownloaded_manuals(brand)
+    pending = database.get_undownloaded_manuals(brand, source="manualslib")
     logger.info(f"Found {len(pending)} manuals to download for {brand}")
 
     for manual_record in pending:
