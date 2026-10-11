@@ -24,9 +24,9 @@ WKHTMLTOPDF_PREAMBLE_RE = re.compile(r'^\s*(?:q\s+)?/GSa gs')
 # Watermarks stamped by the sites a manual passed through before ManualsLib
 # got it. Each is a short text object naming the site, either in a Form
 # XObject drawn on every page or inline in the page's content stream.
-THIRD_PARTY_STAMP_RE = re.compile(rb'cxema\.ru|esquemaseletricos\.com\.br', re.IGNORECASE)
+THIRD_PARTY_STAMP_RE = re.compile(rb'cxema\.ru|esquemaseletricos\.com\.br|chinadse\.org|all-guides\.com', re.IGNORECASE)
 # A text object (BT ... ET) that contains one of the stamps
-STAMP_TEXT_OBJECT_RE = re.compile(rb'BT(?:(?!\bET\b).)*?(?:cxema\.ru|esquemaseletricos\.com\.br)(?:(?!\bET\b).)*?ET\s*', re.DOTALL | re.IGNORECASE)
+STAMP_TEXT_OBJECT_RE = re.compile(rb'BT(?:(?!\bET\b).)*?(?:cxema\.ru|esquemaseletricos\.com\.br|chinadse\.org|all-guides\.com)(?:(?!\bET\b).)*?ET\s*', re.DOTALL | re.IGNORECASE)
 # A stamp form is tiny; a real page drawn as a form is not
 MAX_STAMP_FORM_BYTES = 2000
 
