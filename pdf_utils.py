@@ -23,13 +23,22 @@ WKHTMLTOPDF_PREAMBLE_RE = re.compile(r'^\s*(?:q\s+)?/GSa gs')
 
 
 def _page_content(page) -> str:
+    """
+    The page's decoded content stream, or '' if it has none or cannot be
+    decoded (a damaged stream in the source file). An unreadable page is
+    left exactly as it is; the rest of the file is still processed.
+    """
     contents = page.get('/Contents')
     if contents is None:
         return ''
-    if isinstance(contents, pikepdf.Array):
-        data = b''.join(c.read_bytes() for c in contents)
-    else:
-        data = contents.read_bytes()
+    try:
+        if isinstance(contents, pikepdf.Array):
+            data = b''.join(c.read_bytes() for c in contents)
+        else:
+            data = contents.read_bytes()
+    except Exception as e:
+        logger.warning(f"Skipping page with undecodable content stream: {e}")
+        return ''
     return data.decode('latin-1')
 
 
