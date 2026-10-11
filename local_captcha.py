@@ -58,7 +58,12 @@ class ImageChallengeSolver:
             # transformers' hub lookups log every HEAD request at INFO
             logging.getLogger("httpx").setLevel(logging.WARNING)
             self._detector = Detector()
-            self._detector.detection_models.check_loaded()
+            models = self._detector.detection_models
+            models.check_loaded()
+            # transformers 5 loads the CLIP checkpoint in bfloat16; the tile
+            # tensors are float32 and the matmul refuses mixed dtypes
+            models.vit_model.float()
+            models.seg_model.float()
             logger.info(f"Loaded image challenge models in {time.time() - start:.1f}s")
         return self._detector
 
