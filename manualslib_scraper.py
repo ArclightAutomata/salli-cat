@@ -119,6 +119,9 @@ class ManualUnavailableError(Exception):
 # captcha solved) just to hit the same dead link.
 _unavailable_ids: set[str] = set()
 
+# --retry-unavailable: include manuals previously marked unavailable in the DB
+RETRY_UNAVAILABLE = False
+
 
 class CloudflareChallengeError(Exception):
     """Raised when a page stays behind Cloudflare's challenge interstitial."""
@@ -850,7 +853,7 @@ def download_pending(page: Page, brand: str, download_dir: Path, captcha_solver,
     if reused or archived:
         logger.info(f"Resolved from sibling manuals: {reused} reuse an existing download, {archived} already archived")
 
-    pending = database.get_undownloaded_manuals(brand, source="manualslib")
+    pending = database.get_undownloaded_manuals(brand, source="manualslib", include_unavailable=RETRY_UNAVAILABLE)
     logger.info(f"Found {len(pending)} manuals to download for {brand}")
 
     for manual_record in pending:
@@ -913,6 +916,8 @@ def download_pending(page: Page, brand: str, download_dir: Path, captcha_solver,
             logger.warning(f"Skipping {manual_record['model']}: {e}")
             if manualslib_id:
                 _unavailable_ids.add(str(manualslib_id))
+            marked = database.mark_unavailable(manual_record["id"], str(e))
+            logger.info(f"Marked {marked} manual(s) unavailable; retry them with --retry-unavailable")
         except Exception as e:
             logger.error(f"Error downloading {manual_record['model']}: {e}")
             page = failures.failure(page)
@@ -973,6 +978,7 @@ def main():
     parser.add_argument("--use-discovered", action="store_true", help="Scrape all discovered brands (instead of config)")
     parser.add_argument("--index-only", action="store_true", help="Only build index, don't download")
     parser.add_argument("--download-only", action="store_true", help="Only download pending manuals")
+    parser.add_argument("--retry-unavailable", action="store_true", help="Also retry manuals marked unavailable (dead PDF link) on an earlier run")
     parser.add_argument("--limit", type=int, help="Limit number of downloads")
     parser.add_argument("--upload-to-ia", action="store_true", help="Upload downloaded manuals to Internet Archive")
     parser.add_argument("--ia-limit", type=int, help="Limit number of uploads to Internet Archive")
@@ -991,6 +997,8 @@ def main():
     DELAY_MAX = config.get("delay_max", 5.0)
     STRIP_WATERMARKS = config.get("strip_watermarks", True)
     DOWNLOAD_LIMIT = args.limit
+    global RETRY_UNAVAILABLE
+    RETRY_UNAVAILABLE = args.retry_unavailable
     logger.info(f"Request delays: {DELAY_MIN}-{DELAY_MAX} seconds")
     logger.info(f"Strip watermarks: {STRIP_WATERMARKS}")
     if DOWNLOAD_LIMIT:

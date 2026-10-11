@@ -275,6 +275,8 @@ def status():
     click.echo(f"  Downloaded:       {stats['downloaded']:,}")
     click.echo(f"  Archived:         {stats['archived']:,}")
     click.echo(f"  Pending:          {stats['pending']:,}")
+    if stats.get('unavailable'):
+        click.echo(f"  Unavailable:      {stats['unavailable']:,}  (source no longer serves the file)")
 
     # Per-source stats
     for source in ["manualslib", "manualsbase", "manualzz", "elektrotanya"]:
@@ -285,6 +287,8 @@ def status():
             click.echo(f"  Downloaded: {source_stats['downloaded']:,}")
             click.echo(f"  Archived:   {source_stats['archived']:,}")
             click.echo(f"  Pending:    {source_stats['pending']:,}")
+            if source_stats.get('unavailable'):
+                click.echo(f"  Unavailable: {source_stats['unavailable']:,}")
 
     # Brand stats (if any discovered)
     try:

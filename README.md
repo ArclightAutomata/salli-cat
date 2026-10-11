@@ -441,6 +441,11 @@ The scraper tracks progress in the database:
 - Already-downloaded manuals won't be re-downloaded
 - Archived manuals are skipped
 - Use `--download-only` to resume downloading after interruption
+- A manual whose PDF link is dead on ManualsLib (HTTP 404) is marked
+  `unavailable` in the database, together with its sibling rows, and left out
+  of pending work so later runs don't spend a captcha on it again. `salli
+  status` counts them; `--retry-unavailable` includes them again, and a
+  successful download clears the flag.
 
 ## Rate Limiting
 

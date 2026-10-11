@@ -102,6 +102,9 @@ def init_db():
         ("downloaded_at", "TEXT"),
         ("archive_checked_at", "TEXT"),
         ("original_filename", "TEXT"),
+        ("unavailable", "INTEGER DEFAULT 0"),
+        ("unavailable_reason", "TEXT"),
+        ("unavailable_at", "TEXT"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE manuals ADD COLUMN {col} {coltype}")
@@ -490,7 +493,7 @@ def update_downloaded(
     # Update manuals table (backward compatibility)
     cursor.execute("""
         UPDATE manuals
-        SET downloaded = 1, file_path = ?, file_sha1 = ?, file_md5 = ?, file_size = ?,
+        SET downloaded = 1, unavailable = 0, file_path = ?, file_sha1 = ?, file_md5 = ?, file_size = ?,
             downloaded_at = ?, original_filename = ?, original_file_sha1 = ?, original_file_md5 = ?
         WHERE id = ?
     """, (file_path, file_sha1, file_md5, file_size, downloaded_at, original_filename,
@@ -801,19 +804,23 @@ def get_all_manuals(brand: str = None, downloaded: bool = None, source: str = No
 
 
 def get_brands_with_pending(source: str = "manualslib") -> list[str]:
-    """Brands that still have manuals to download (not downloaded, not archived)."""
+    """Brands that still have manuals to download (not downloaded, not archived, not unavailable)."""
     conn = get_connection()
     rows = conn.execute("""
         SELECT brand, COUNT(*) AS n FROM manuals
-        WHERE source = ? AND downloaded = 0 AND archived = 0
+        WHERE source = ? AND downloaded = 0 AND archived = 0 AND unavailable = 0
         GROUP BY brand ORDER BY n DESC
     """, (source,)).fetchall()
     conn.close()
     return [row["brand"] for row in rows]
 
 
-def get_undownloaded_manuals(brand: str = None, include_archived: bool = False, source: str = None) -> list[dict]:
-    """Get manuals that haven't been downloaded. By default excludes archived manuals."""
+def get_undownloaded_manuals(brand: str = None, include_archived: bool = False, source: str = None,
+                             include_unavailable: bool = False) -> list[dict]:
+    """
+    Get manuals that haven't been downloaded. By default excludes archived
+    manuals and ones marked unavailable (the site no longer serves the file).
+    """
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -822,6 +829,9 @@ def get_undownloaded_manuals(brand: str = None, include_archived: bool = False, 
 
     if not include_archived:
         query += " AND archived = 0"
+
+    if not include_unavailable:
+        query += " AND unavailable = 0"
 
     if brand:
         query += " AND brand = ?"
@@ -835,6 +845,39 @@ def get_undownloaded_manuals(brand: str = None, include_archived: bool = False, 
 
     cursor.execute(query, params)
     rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def mark_unavailable(manual_id: int, reason: str) -> int:
+    """
+    Record that the source no longer serves this manual's file, so it is
+    left out of pending work until retried explicitly. Sibling rows (same
+    document) are marked too. Returns the number of rows marked.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute(f"""
+        UPDATE manuals
+        SET unavailable = 1, unavailable_reason = ?, unavailable_at = ?
+        WHERE downloaded = 0 AND unavailable = 0
+          AND (id = ? OR ({SIBLING_KEY}) = (SELECT {SIBLING_KEY} FROM manuals WHERE id = ?))
+    """, (reason[:500], now, manual_id, manual_id))
+    marked = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return marked
+
+
+def get_unavailable_manuals(source: str = None) -> list[dict]:
+    conn = get_connection()
+    query = "SELECT * FROM manuals WHERE unavailable = 1"
+    params = []
+    if source:
+        query += " AND source = ?"
+        params.append(source)
+    rows = conn.execute(query + " ORDER BY unavailable_at DESC", params).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
@@ -858,8 +901,11 @@ def get_stats(source: str = None) -> dict:
     cursor.execute(f"SELECT COUNT(*) as archived FROM manuals WHERE archived = 1{' AND source = ?' if source else ''}", params)
     archived = cursor.fetchone()["archived"]
 
-    cursor.execute(f"SELECT COUNT(*) as pending FROM manuals WHERE downloaded = 0 AND archived = 0{' AND source = ?' if source else ''}", params)
+    cursor.execute(f"SELECT COUNT(*) as pending FROM manuals WHERE downloaded = 0 AND archived = 0 AND unavailable = 0{' AND source = ?' if source else ''}", params)
     pending = cursor.fetchone()["pending"]
+
+    cursor.execute(f"SELECT COUNT(*) as unavailable FROM manuals WHERE unavailable = 1{' AND source = ?' if source else ''}", params)
+    unavailable = cursor.fetchone()["unavailable"]
 
     cursor.execute(f"SELECT COUNT(*) as pending_archive FROM manuals WHERE downloaded = 1 AND archived = 0{' AND source = ?' if source else ''}", params)
     pending_archive = cursor.fetchone()["pending_archive"]
@@ -869,7 +915,7 @@ def get_stats(source: str = None) -> dict:
                COUNT(*) as total,
                SUM(CASE WHEN downloaded = 1 THEN 1 ELSE 0 END) as downloaded,
                SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived,
-               SUM(CASE WHEN downloaded = 0 AND archived = 0 THEN 1 ELSE 0 END) as pending
+               SUM(CASE WHEN downloaded = 0 AND archived = 0 AND unavailable = 0 THEN 1 ELSE 0 END) as pending
         FROM manuals
     """
     if source:
@@ -901,6 +947,7 @@ def get_stats(source: str = None) -> dict:
         "archived": archived,
         "pending": pending,
         "pending_archive": pending_archive,
+        "unavailable": unavailable,
         "by_brand": by_brand,
         "by_source": by_source,
     }
