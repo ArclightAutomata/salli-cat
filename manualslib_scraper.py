@@ -24,6 +24,7 @@ load_dotenv()
 import database
 from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user, wait_for_cloudflare, get_proxy_url
 from captcha_solver import TwoCaptchaSolver, extract_sitekey_from_page, inject_captcha_response
+from local_captcha import LocalSolver, ImageChallengeSolver, WhisperTranscriber
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,6 +122,13 @@ _unavailable_ids: set[str] = set()
 
 class CloudflareChallengeError(Exception):
     """Raised when a page stays behind Cloudflare's challenge interstitial."""
+
+
+# Set in main() when local captcha solving is enabled: reCAPTCHAs are first
+# attempted in the browser (checkbox click, image challenge via local vision
+# models, audio challenge via Whisper) and 2captcha is only paid for when
+# that fails.
+_local_solver: LocalSolver | None = None
 
 
 # Transient network failures (a proxy hop dropping the TLS handshake, a
@@ -525,6 +533,14 @@ def wait_for_captcha_solved(page: Page, timeout: int = CAPTCHA_TIMEOUT, captcha_
 
     Returns True if solved, False if timeout.
     """
+    # Free first: checkbox click, then audio challenge + local Whisper
+    if _local_solver is not None:
+        logger.info("Attempting local captcha solving...")
+        if _local_solver.solve(page):
+            time.sleep(1)
+            return True
+        logger.info("Local captcha solving did not succeed" + (", trying 2captcha" if captcha_solver else ""))
+
     # Try automatic solving with 2captcha if configured
     if captcha_solver:
         logger.info("Attempting automatic captcha solving with 2captcha...")
@@ -993,6 +1009,17 @@ def main():
             logger.warning("2captcha API key configured but could not verify balance")
     else:
         logger.info("2captcha not configured - will use manual captcha solving")
+
+    global _local_solver
+    if get_config(config, "local_captcha", True):
+        _local_solver = LocalSolver(
+            image=ImageChallengeSolver() if get_config(config, "captcha_image_solver", True) else None,
+            audio=WhisperTranscriber(
+                model_size=get_config(config, "whisper_model", "small.en"),
+                device=get_config(config, "whisper_device", "auto"),
+            ) if get_config(config, "captcha_audio_solver", True) else None,
+        )
+        logger.info(f"Local captcha solving enabled: {_local_solver.describe()}; 2captcha is the fallback")
 
     database.init_db()
 

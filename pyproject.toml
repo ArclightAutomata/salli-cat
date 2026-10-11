@@ -14,6 +14,9 @@ dependencies = [
     "internetarchive",
     "pikepdf>=10.1.0",
     "patchright>=1.63.0",
+    "faster-whisper>=1.2.1",
+    "recognizer>=1.4",
+    "av<16",
 ]
 
 [project.scripts]

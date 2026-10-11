@@ -270,11 +270,21 @@ Each scraper has its own namespace (`manualslib`, `manualsbase`, `manualzz`) whe
 
 ## Captcha Handling
 
-ManualsLib and ManualsBase use reCAPTCHA to protect manual downloads. The scrapers support two modes:
+ManualsLib and ManualsBase use reCAPTCHA to protect manual downloads. The scrapers support three modes, tried in this order:
 
-### Automatic Solving with 2captcha (Recommended)
+### Local Solving (Free, Default)
 
-For hands-free operation, configure 2captcha automatic solving:
+With `local_captcha: true` (the default) the ManualsLib scraper first tries to pass the reCAPTCHA itself, inside the browser session (`local_captcha.py`):
+
+1. **Checkbox**: it clicks "I'm not a robot". From a home IP in a real headful browser, Google usually accepts this with no challenge at all. Proxy IPs are challenged every time.
+2. **Image challenge** (`captcha_image_solver`): "Select all images with a bus" grids are solved with local vision models via [reCognizer](https://github.com/Vinyzu/recognizer) (YOLOv8-seg for the object classes it knows, CLIP for the rest). Each tile is screenshotted and classified; 3x3, 3x3 dynamic (tiles are replaced until none match) and 4x4 "select all squares" grids are handled, and "Please try again" gets a fresh grid, up to 6 per captcha. About 1-2 s per grid on CPU; the ~1 GB of weights are downloaded on first use. Typically 20-25 s per manual through the proxy, no cost.
+3. **Audio challenge** (`captcha_audio_solver`): transcribed locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (`whisper_model`, default `small.en`; `whisper_device: auto` uses CUDA when available). Google refuses the audio challenge to most proxy IPs ("Try again later"), so this layer mostly matters off-proxy.
+
+Only if all of that fails does it fall through to 2captcha. Note that reCognizer is GPL-3.0 licensed.
+
+### Automatic Solving with 2captcha (Fallback)
+
+Configure 2captcha so that captchas the local solver can't pass are still handled hands-free:
 
 1. Get an API key from [2captcha.com](https://2captcha.com/enterpage)
 2. Copy `.env.example` to `.env` and add your API key:
@@ -290,9 +300,9 @@ When 2captcha is configured, the scraper will:
 - Inject the solution token and continue automatically
 - Fall back to manual solving if 2captcha fails
 
-### Manual Solving (Fallback)
+### Manual Solving (Last Resort)
 
-If 2captcha is not configured (or fails), the scraper falls back to manual solving:
+If neither local solving nor 2captcha succeeds (or 2captcha is not configured), the scraper falls back to manual solving:
 
 1. **Visible Browser**: Playwright runs in headed mode (you see the browser window)
 2. **Detection**: When a captcha appears, the scraper detects it and pauses

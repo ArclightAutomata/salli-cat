@@ -29,3 +29,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# reCognizer downloads its YOLO weights into the working directory
+yolov8*.pt

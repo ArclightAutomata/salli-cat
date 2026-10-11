@@ -26,6 +26,22 @@ stealth: false
 # Use proxy for browser (requires PROXY_* vars in .env)
 use_proxy: false
 
+# Solve reCAPTCHAs locally before paying 2captcha: click the checkbox (a home
+# IP is often let straight through), then solve the image challenge with
+# local vision models (reCognizer: YOLO + CLIP), then try the audio challenge
+# with Whisper. 2captcha (TWOCAPTCHA_API_KEY in .env) is only used when all of
+# that fails.
+local_captcha: true
+# Image challenges ("Select all images with a bus"). ~1 GB of model weights
+# are downloaded on first use; uses the GPU when torch can see one.
+captcha_image_solver: true
+# Audio challenges. Google refuses these to most proxy IPs, so this mostly
+# matters off-proxy. faster-whisper model: tiny.en / base.en / small.en.
+captcha_audio_solver: true
+whisper_model: small.en
+# auto = CUDA when available, else CPU (int8)
+whisper_device: auto
+
 # Delay between requests in seconds
 delay_min: 0
 delay_max: 0
@@ -72,6 +88,9 @@ manualslib:
     - tv-dvd-combo
     - tv-vcr-combo
   # Override global settings for this scraper:
+  # Required at scale: manualslib bans an IP after ~40 downloads. Behind the
+  # proxy Google always presents the reCAPTCHA image challenge (and refuses
+  # the audio one), which the local image solver handles.
   use_proxy: true
   # browser: firefox
   # stealth: false
