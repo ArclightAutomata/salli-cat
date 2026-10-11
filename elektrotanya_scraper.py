@@ -479,7 +479,7 @@ def main():
     # Without rotation the per-IP limit is the run limit; with it, only --limit caps the run
     run_limit = args.limit if args.limit is not None else (None if rotate else per_ip_limit)
 
-    download_dir = Path(get_config(config, "download_dir", "./downloads"))
+    download_dir = Path(get_config(config, "download_dir", "./downloads")).resolve()
 
     if not args.download_only:
         index(queries, categories)
