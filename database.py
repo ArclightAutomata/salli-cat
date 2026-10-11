@@ -221,6 +221,47 @@ def add_file_variant(
         conn.close()
 
 
+def replace_primary_variant(manual_id: int, variant_type: str, file_path: str, file_sha1: str, file_md5: str, file_size: int):
+    """
+    Point a manual at a new primary file: upsert the variant row, make it the
+    only primary, and mirror it into the manuals table's legacy file columns.
+    Other variants (e.g. 'original') are left untouched.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO file_variants (manual_id, variant_type, file_path, file_sha1, file_md5, file_size, is_primary)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(manual_id, variant_type) DO UPDATE SET
+            file_path = excluded.file_path, file_sha1 = excluded.file_sha1,
+            file_md5 = excluded.file_md5, file_size = excluded.file_size, is_primary = 1
+    """, (manual_id, variant_type, file_path, file_sha1, file_md5, file_size))
+    cursor.execute("UPDATE file_variants SET is_primary = 0 WHERE manual_id = ? AND variant_type != ?", (manual_id, variant_type))
+    cursor.execute("""
+        UPDATE manuals SET file_path = ?, file_sha1 = ?, file_md5 = ?, file_size = ? WHERE id = ?
+    """, (file_path, file_sha1, file_md5, file_size, manual_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_file_variant(manual_id: int, variant_type: str):
+    conn = get_connection()
+    conn.execute("DELETE FROM file_variants WHERE manual_id = ? AND variant_type = ?", (manual_id, variant_type))
+    conn.commit()
+    conn.close()
+
+
+def is_file_referenced(file_path: str) -> bool:
+    """True if any manual or file variant still points at this path."""
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT EXISTS(SELECT 1 FROM file_variants WHERE file_path = ?)
+            OR EXISTS(SELECT 1 FROM manuals WHERE file_path = ?)
+    """, (file_path, file_path)).fetchone()
+    conn.close()
+    return bool(row[0])
+
+
 def get_file_variants(manual_id: int) -> list[dict]:
     """Get all file variants for a manual."""
     conn = get_connection()

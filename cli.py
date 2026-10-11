@@ -236,6 +236,28 @@ def check_archive(continuous, delay_min, delay_max, stats):
 # =============================================================================
 
 @cli.command()
+@click.option("--source", default="manualslib", help="Source to re-strip (default: manualslib)")
+@click.option("--include-archived", is_flag=True, help="Also re-strip manuals already uploaded to IA (they will need re-uploading)")
+@click.option("--limit", type=int, help="Max distinct originals to process")
+@click.option("--dry-run", is_flag=True, help="Report what would change without touching anything")
+def restrip(source, include_archived, limit, dry_run):
+    """Re-strip downloaded manuals from their untouched originals with the current stripper."""
+    import sys
+
+    argv = ["--source", source]
+    if include_archived:
+        argv.append("--include-archived")
+    if limit:
+        argv.extend(["--limit", str(limit)])
+    if dry_run:
+        argv.append("--dry-run")
+    sys.argv = ["restrip"] + argv
+
+    from restrip import main
+    main()
+
+
+@cli.command()
 def status():
     """Show current scraping and upload statistics."""
     import database
