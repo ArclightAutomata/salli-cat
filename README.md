@@ -435,3 +435,17 @@ The scraper tracks progress in the database:
 ## Rate Limiting
 
 The scraper includes random delays between requests (2-5 seconds) to avoid overwhelming the server.
+
+## Roadmap
+
+- **Re-strip already-downloaded ManualsLib manuals.** Since mid-February 2026
+  ManualsLib has wrapped its PDFs in extra pages (a cover with "Quick Links"
+  and a table of contents at the front, an "Other ManualsLib Projects" page at
+  the back). The stripper removes them now, but the stripped variants produced
+  before this - and the copies uploaded to the Internet Archive - still carry
+  them: a sample of the ~5,600 originals downloaded since 2026-02-16 found
+  wrapper pages in about 60%. The untouched originals are kept as the
+  `original` file variant, so the fix is a `restrip` command that re-derives
+  the stripped variant from each original (`pdf_utils.strip_manualslib_watermark`
+  is idempotent), updates the variant's checksums, and re-uploads the file to
+  the existing IA item.
