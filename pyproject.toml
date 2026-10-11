@@ -17,6 +17,7 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "recognizer>=1.4",
     "av<16",
+    "pillow>=12.1.0",
 ]
 
 [project.scripts]

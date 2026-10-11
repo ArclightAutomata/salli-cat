@@ -21,6 +21,24 @@ MAX_WRAPPER_PAGES = 40
 # an extra q); the manual's own pages never do.
 WKHTMLTOPDF_PREAMBLE_RE = re.compile(r'^\s*(?:q\s+)?/GSa gs')
 
+# Watermarks stamped by the sites a manual passed through before ManualsLib
+# got it. Each is a short text object naming the site, either in a Form
+# XObject drawn on every page or inline in the page's content stream.
+THIRD_PARTY_STAMP_RE = re.compile(rb'cxema\.ru|esquemaseletricos\.com\.br', re.IGNORECASE)
+# A text object (BT ... ET) that contains one of the stamps
+STAMP_TEXT_OBJECT_RE = re.compile(rb'BT(?:(?!\bET\b).)*?(?:cxema\.ru|esquemaseletricos\.com\.br)(?:(?!\bET\b).)*?ET\s*', re.DOTALL | re.IGNORECASE)
+# A stamp form is tiny; a real page drawn as a form is not
+MAX_STAMP_FORM_BYTES = 2000
+
+# Full-page advert images some sites prepend to manuals, recognised by the
+# perceptual (difference) hash of the image: 64 bits, 8x8 gradient signs of
+# the greyscale image. A page is removed if it is image-only, at the start or
+# end of the file, and within JUNK_COVER_MAX_DISTANCE bits of a known hash.
+JUNK_COVER_HASHES = {
+    0x1da5d7e353d3a58e: "esquemaseletricos.com.br red advert page",
+}
+JUNK_COVER_MAX_DISTANCE = 10
+
 
 def _page_content(page) -> str:
     """
@@ -123,6 +141,129 @@ def _prune_dangling_outlines(pdf: pikepdf.Pdf) -> None:
         del pdf.Root['/Outlines']
 
 
+def _walk_xobjects(container, visited=None, depth=0):
+    """Yield (name, xobject) for every XObject reachable from a page or form, nested forms included."""
+    if visited is None:
+        visited = set()
+    if depth > 6:
+        return
+    resources = container.get('/Resources')
+    if resources is None:
+        return
+    for name, xobj in dict(resources.get('/XObject', {})).items():
+        key = xobj.objgen
+        if key in visited:
+            continue
+        visited.add(key)
+        yield name, xobj
+        if xobj.get('/Subtype') == '/Form':
+            yield from _walk_xobjects(xobj, visited, depth + 1)
+
+
+def _has_fonts(container, depth=0) -> bool:
+    resources = container.get('/Resources')
+    if resources is None or depth > 6:
+        return False
+    if len(dict(resources.get('/Font', {}))):
+        return True
+    return any(xobj.get('/Subtype') == '/Form' and _has_fonts(xobj, depth + 1)
+               for _, xobj in _walk_xobjects(container))
+
+
+def _strip_third_party_stamps(pdf: pikepdf.Pdf) -> int:
+    """
+    Blank the text stamps of sites like cxema.ru. Returns the number of
+    pages changed. A stamp drawn via a Form XObject is emptied (the page's
+    invocation of it then draws nothing); one inline in the page content
+    has its text object cut out.
+    """
+    changed = 0
+    emptied: set = set()
+    for page in pdf.pages:
+        page_changed = False
+        for _name, xobj in _walk_xobjects(page.obj):
+            if xobj.get('/Subtype') != '/Form':
+                continue
+            if xobj.objgen in emptied:
+                page_changed = True  # shares a stamp form already blanked
+                continue
+            try:
+                if int(xobj.get('/Length', MAX_STAMP_FORM_BYTES + 1)) > MAX_STAMP_FORM_BYTES * 4:
+                    continue
+                data = xobj.read_bytes()
+            except Exception:
+                continue
+            if len(data) <= MAX_STAMP_FORM_BYTES and THIRD_PARTY_STAMP_RE.search(data):
+                xobj.write(b'')
+                emptied.add(xobj.objgen)
+                page_changed = True
+        text = _page_content(page)
+        if text and THIRD_PARTY_STAMP_RE.search(text.encode('latin-1')):
+            cleaned = STAMP_TEXT_OBJECT_RE.sub(b'', text.encode('latin-1'))
+            if cleaned != text.encode('latin-1'):
+                page['/Contents'] = pdf.make_stream(cleaned)
+                page_changed = True
+        if page_changed:
+            changed += 1
+    return changed
+
+
+def image_dhash(image) -> int:
+    """64-bit difference hash of a PIL image."""
+    from PIL import Image
+
+    grey = image.convert('L').resize((9, 8), Image.LANCZOS)
+    px = list(grey.tobytes())
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            bits = (bits << 1) | (px[row * 9 + col] > px[row * 9 + col + 1])
+    return bits
+
+
+def _sole_image(page) -> pikepdf.Object | None:
+    """The page's only image, if the page is nothing but that image (no text anywhere)."""
+    if _has_fonts(page.obj):
+        return None
+    images = [x for _, x in _walk_xobjects(page.obj) if x.get('/Subtype') == '/Image']
+    return images[0] if len(images) == 1 else None
+
+
+def page_image_hash(page) -> int | None:
+    """dhash of an image-only page's image, else None."""
+    image = _sole_image(page)
+    if image is None:
+        return None
+    try:
+        return image_dhash(pikepdf.PdfImage(image).as_pil_image())
+    except Exception:
+        return None
+
+
+def _junk_cover(page) -> str | None:
+    h = page_image_hash(page)
+    if h is None:
+        return None
+    for known, label in JUNK_COVER_HASHES.items():
+        if bin(h ^ known).count('1') <= JUNK_COVER_MAX_DISTANCE:
+            return label
+    return None
+
+
+def _remove_junk_cover_pages(pdf: pikepdf.Pdf) -> int:
+    """Drop known advert pages from the front and back of the file. Returns pages removed."""
+    removed = 0
+    while len(pdf.pages) > 1 and (label := _junk_cover(pdf.pages[0])):
+        logger.info(f"Removed first page: {label}")
+        del pdf.pages[0]
+        removed += 1
+    while len(pdf.pages) > 1 and (label := _junk_cover(pdf.pages[-1])):
+        logger.info(f"Removed last page: {label}")
+        del pdf.pages[-1]
+        removed += 1
+    return removed
+
+
 def strip_manualslib_watermark(pdf_path: Path | str) -> bool:
     """
     Remove ManualsLib's additions from a PDF file in-place.
@@ -133,6 +274,10 @@ def strip_manualslib_watermark(pdf_path: Path | str) -> bool:
       find_manualslib_wrapper_pages)
     - On every page: the footer "Downloaded from www.Manualslib.com manuals
       search engine" and a link annotation to manualslib.com
+
+    Also removes marks left by the sites the manual passed through before:
+    - Text stamps naming the site on every page (THIRD_PARTY_STAMP_RE)
+    - Known full-page advert images at the front or back (JUNK_COVER_HASHES)
 
     Args:
         pdf_path: Path to the PDF file
@@ -155,6 +300,15 @@ def strip_manualslib_watermark(pdf_path: Path | str) -> bool:
             _prune_dangling_outlines(pdf)
             modified = True
             logger.info(f"Removed {leading} leading and {trailing} trailing ManualsLib wrapper pages from {pdf_path}")
+
+        if _remove_junk_cover_pages(pdf):
+            _prune_dangling_outlines(pdf)
+            modified = True
+
+        stamped = _strip_third_party_stamps(pdf)
+        if stamped:
+            modified = True
+            logger.info(f"Removed third-party site stamps from {stamped} pages of {pdf_path}")
 
         for page in pdf.pages:
             # Remove link annotations to manualslib.com
