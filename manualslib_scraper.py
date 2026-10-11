@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from patchright.sync_api import sync_playwright, Page
+from patchright.sync_api import sync_playwright, Page, Error as PlaywrightError
 
 from pdf_utils import strip_manualslib_watermark
 
@@ -123,9 +123,28 @@ class CloudflareChallengeError(Exception):
     """Raised when a page stays behind Cloudflare's challenge interstitial."""
 
 
+# Transient network failures (a proxy hop dropping the TLS handshake, a
+# reset connection) are retried this many times before the error propagates.
+NAVIGATE_RETRIES = 3
+
+
 def navigate(page: Page, url: str) -> None:
-    """Go to a manualslib URL and wait out Cloudflare's challenge if it appears."""
-    page.goto(url, wait_until="domcontentloaded")
+    """Go to a manualslib URL and wait out Cloudflare's challenge if it appears.
+
+    Chromium network errors (net::ERR_*) and navigation timeouts are retried
+    with a short backoff; anything else is raised immediately.
+    """
+    for attempt in range(1, NAVIGATE_RETRIES + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            break
+        except PlaywrightError as e:
+            transient = "net::ERR_" in str(e) or "Timeout" in type(e).__name__
+            if not transient or attempt == NAVIGATE_RETRIES:
+                raise
+            delay = 5 * attempt
+            logger.warning(f"Navigation to {url} failed ({str(e).splitlines()[0]}); retry {attempt}/{NAVIGATE_RETRIES - 1} in {delay}s")
+            time.sleep(delay)
     if not wait_for_cloudflare(page):
         raise CloudflareChallengeError(f"Cloudflare challenge not passed for {url}")
 
