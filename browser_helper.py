@@ -10,7 +10,9 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -134,6 +136,61 @@ def get_proxy_url() -> str | None:
         user = resolve_proxy_user(user)
         return f"http://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{host}:{port}"
     return None
+
+
+# A small plain-HTTP URL for checking the proxy itself. Plain HTTP so a
+# proxy-level refusal comes back as an ordinary 407 response we can read,
+# rather than a failed CONNECT tunnel.
+PROXY_PROBE_URL = "http://example.com/"
+# How often to re-check while the proxy's traffic allowance is used up
+PROXY_QUOTA_RECHECK_SECONDS = 300
+
+
+def proxy_refusal() -> str | None:
+    """
+    Ask the proxy for a tiny page. Returns the provider's message if the proxy
+    itself refuses us (HTTP 407 with working credentials - e.g. Decodo's
+    "You've reached your current traffic limit"), else None. Other failures
+    (timeouts, the target being down) are not the proxy refusing, so None.
+    """
+    proxy_url = get_proxy_url()
+    if not proxy_url:
+        return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    try:
+        with opener.open(PROXY_PROBE_URL, timeout=30):
+            return None
+    except urllib.error.HTTPError as e:
+        if e.code != 407:
+            return None
+        message = e.headers.get("x-error-message")
+        if not message:
+            try:
+                message = e.read(500).decode("utf-8", "replace").strip()
+            except Exception:
+                message = ""
+        return message or "HTTP 407 Proxy Authentication Required"
+    except Exception:
+        return None
+
+
+def wait_while_proxy_refuses(message: str, recheck: int = PROXY_QUOTA_RECHECK_SECONDS) -> None:
+    """
+    Pause until the proxy accepts requests again (e.g. after its traffic
+    allowance is topped up), re-checking every `recheck` seconds. Ctrl-C
+    stops the run as usual.
+    """
+    logger.error(f"Proxy refused the request: {message}")
+    logger.error(f"Pausing until the proxy works again (re-checking every {recheck // 60} min; Ctrl-C to stop)")
+    waited = 0
+    while True:
+        time.sleep(recheck)
+        waited += recheck
+        still = proxy_refusal()
+        if not still:
+            logger.info(f"Proxy is accepting requests again after {waited // 60} min - resuming")
+            return
+        logger.info(f"Proxy still refusing after {waited // 60} min: {still}")
 
 
 def get_proxy_config() -> dict | None:

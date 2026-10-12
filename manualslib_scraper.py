@@ -22,7 +22,7 @@ from pdf_utils import strip_manualslib_watermark
 load_dotenv()
 
 import database
-from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user, wait_for_cloudflare, get_proxy_url, describe_proxy
+from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user, wait_for_cloudflare, get_proxy_url, describe_proxy, proxy_refusal, wait_while_proxy_refuses
 from captcha_solver import TwoCaptchaSolver, extract_sitekey_from_page, inject_captcha_response
 from local_captcha import LocalSolver, ImageChallengeSolver, WhisperTranscriber
 
@@ -138,6 +138,10 @@ _local_solver: LocalSolver | None = None
 # reset connection) are retried this many times before the error propagates.
 NAVIGATE_RETRIES = 3
 
+# Set in main(): whether the browser goes through the proxy, so a failed
+# navigation is worth checking against the proxy itself (traffic limit etc.)
+_PROXY_IN_USE = False
+
 
 def navigate(page: Page, url: str) -> None:
     """Go to a manualslib URL and wait out Cloudflare's challenge if it appears.
@@ -151,6 +155,15 @@ def navigate(page: Page, url: str) -> None:
             break
         except PlaywrightError as e:
             transient = "net::ERR_" in str(e) or "Timeout" in type(e).__name__
+            if transient and _PROXY_IN_USE:
+                # A proxy that refuses us (traffic allowance used up) shows up in
+                # Chromium as a vague net::ERR_*; ask the proxy directly, and if
+                # it is refusing, wait for it instead of failing the manual
+                refusal = proxy_refusal()
+                if refusal:
+                    wait_while_proxy_refuses(refusal)
+                    page.goto(url, wait_until="domcontentloaded")
+                    break
             if not transient or attempt == NAVIGATE_RETRIES:
                 raise
             delay = 5 * attempt
@@ -1073,6 +1086,8 @@ def main():
         logger.warning("Ignoring stealth: true - stealth patches break manualslib's Cloudflare challenge")
         use_stealth = False
     use_proxy = get_config(config, "use_proxy", False)
+    global _PROXY_IN_USE
+    _PROXY_IN_USE = bool(use_proxy)
     extension_path = get_extension_path(config, project_dir)
 
     # Log proxy configuration (proxy is only used for browser, not file downloads)

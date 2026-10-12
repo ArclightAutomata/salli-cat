@@ -444,6 +444,10 @@ The scraper tracks progress in the database:
 - Already-downloaded manuals won't be re-downloaded
 - Archived manuals are skipped
 - Use `--download-only` to resume downloading after interruption
+- If the proxy itself refuses requests, for example Decodo's "You've reached
+  your current traffic limit", the ManualsLib and Elektrotanya scrapers pause
+  and re-check every 5 minutes instead of failing manual after manual. Top up
+  the allowance and the run resumes on its own; Ctrl-C stops it as usual.
 - A manual whose PDF link is dead on ManualsLib (HTTP 404) is marked
   `unavailable` in the database, together with its sibling rows, and left out
   of pending work so later runs don't spend a captcha on it again. `salli

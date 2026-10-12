@@ -47,6 +47,7 @@ import logging
 import random
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -55,7 +56,7 @@ import yaml
 from dotenv import load_dotenv
 
 import database
-from browser_helper import get_proxy_url, proxy_supports_rotation
+from browser_helper import get_proxy_url, proxy_supports_rotation, proxy_refusal, wait_while_proxy_refuses
 from captcha_solver import TwoCaptchaSolver
 
 load_dotenv()
@@ -178,6 +179,20 @@ def get_captcha_solver() -> TwoCaptchaSolver | None:
     return _captcha_solver
 
 
+def _open(req: urllib.request.Request, timeout: int):
+    """Open a request through the current session, waiting out a proxy that refuses us (traffic limit)."""
+    while True:
+        try:
+            return get_session().opener.open(req, timeout=timeout)
+        except (urllib.error.URLError, OSError) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code != 407:
+                raise
+            refusal = proxy_refusal() if get_session().proxy_url else None
+            if not refusal:
+                raise
+            wait_while_proxy_refuses(refusal)
+
+
 def _http_post(url: str, fields: dict, referer: str = None, timeout: int = 30) -> tuple[bytes, str]:
     """POST form fields through the shared cookie jar. Returns (body_bytes, content_type)."""
     headers = {
@@ -190,7 +205,7 @@ def _http_post(url: str, fields: dict, referer: str = None, timeout: int = 30) -
         headers["Referer"] = referer
     data = urllib.parse.urlencode(fields).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with get_session().opener.open(req, timeout=timeout) as resp:
+    with _open(req, timeout) as resp:
         return resp.read(), resp.headers.get("Content-Type", "")
 
 
@@ -200,7 +215,7 @@ def _http_get(url: str, referer: str = None, timeout: int = 30) -> tuple[bytes, 
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    with get_session().opener.open(req, timeout=timeout) as resp:
+    with _open(req, timeout) as resp:
         return resp.read(), resp.headers.get("Content-Type", "")
 
 
