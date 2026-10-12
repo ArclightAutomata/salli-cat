@@ -473,6 +473,7 @@ The scraper includes random delays between requests (2-5 seconds) to avoid overw
   the existing IA item. The same applies to marks the stripper learned about
   later: text stamps from the sites a manual passed through before ManualsLib
   (`http://cxema.ru`, `www.chinadse.org` and `all-guides.com` on every page) and full-page advert images prepended to
-  the manual (esquemaseletricos.com.br), see `THIRD_PARTY_STAMP_RE` and
-  `JUNK_COVER_HASHES` in `pdf_utils.py`. New stamps and covers are added
+  the manual (esquemaseletricos.com.br), see `THIRD_PARTY_STAMP_RE`,
+  `JUNK_COVER_HASHES` and `STAMP_IMAGE_HASHES` (logo banners drawn as images,
+  such as tecnicosaurios.com) in `pdf_utils.py`. New stamps and covers are added
   there as they turn up; `salli restrip` then re-derives the affected files.

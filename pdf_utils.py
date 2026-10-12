@@ -39,6 +39,17 @@ JUNK_COVER_HASHES = {
 }
 JUNK_COVER_MAX_DISTANCE = 10
 
+# Logo/URL banners other sites draw over the manual's own pages as images
+# (so text matching can't see them), recognised the same way by the dhash of
+# the image. Only the drawing of the image is removed; the page stays.
+STAMP_IMAGE_HASHES = {
+    0x004565751939f2f2: "tecnicosaurios.com diagonal banner",
+}
+STAMP_IMAGE_MAX_DISTANCE = 8
+# Banners are wide strips; only images this much wider than tall are hashed,
+# which keeps the pass cheap on scanned manuals full of page-sized images
+STAMP_IMAGE_MIN_ASPECT = 6
+
 
 def _page_content(page) -> str:
     """
@@ -208,6 +219,84 @@ def _strip_third_party_stamps(pdf: pikepdf.Pdf) -> int:
     return changed
 
 
+def _stamp_image_label(xobj) -> str | None:
+    try:
+        width, height = int(xobj.get('/Width', 0)), int(xobj.get('/Height', 0))
+        if not height or width / height < STAMP_IMAGE_MIN_ASPECT:
+            return None
+        h = image_dhash(pikepdf.PdfImage(xobj).as_pil_image())
+    except Exception:
+        return None
+    for known, label in STAMP_IMAGE_HASHES.items():
+        if bin(h ^ known).count('1') <= STAMP_IMAGE_MAX_DISTANCE:
+            return label
+    return None
+
+
+def _strip_stamp_images(pdf: pikepdf.Pdf) -> int:
+    """
+    Stop drawing known banner images (STAMP_IMAGE_HASHES): every `/Name Do`
+    that paints one is removed from the page or form that paints it.
+    Returns the number of pages changed.
+    """
+    verdicts: dict = {}
+    cleaned_forms: set = set()
+
+    def stamp_names(container) -> list[bytes]:
+        names = []
+        resources = container.get('/Resources')
+        if resources is None:
+            return names
+        for name, xobj in dict(resources.get('/XObject', {})).items():
+            if xobj.get('/Subtype') != '/Image':
+                continue
+            if xobj.objgen not in verdicts:
+                verdicts[xobj.objgen] = _stamp_image_label(xobj)
+            if verdicts[xobj.objgen]:
+                names.append(str(name).encode('latin-1'))
+        return names
+
+    def strip(data: bytes, names: list[bytes]) -> bytes:
+        for name in names:
+            data = re.sub(rb'(?<![^\s\[\]()<>{}/%])' + re.escape(name) + rb'\s+Do\b', b'', data)
+        return data
+
+    changed = 0
+    for page in pdf.pages:
+        page_changed = False
+        names = stamp_names(page.obj)
+        if names:
+            text = _page_content(page)
+            if text:
+                new = strip(text.encode('latin-1'), names)
+                if new != text.encode('latin-1'):
+                    page['/Contents'] = pdf.make_stream(new)
+                    page_changed = True
+        for _name, xobj in _walk_xobjects(page.obj):
+            if xobj.get('/Subtype') != '/Form':
+                continue
+            if xobj.objgen in cleaned_forms:
+                page_changed = True
+                continue
+            names = stamp_names(xobj)
+            if not names:
+                continue
+            try:
+                data = xobj.read_bytes()
+            except Exception:
+                continue
+            new = strip(data, names)
+            if new != data:
+                xobj.write(new)
+                cleaned_forms.add(xobj.objgen)
+                page_changed = True
+        if page_changed:
+            changed += 1
+    for label in {v for v in verdicts.values() if v}:
+        logger.info(f"Removed stamp image: {label}")
+    return changed
+
+
 def image_dhash(image) -> int:
     """64-bit difference hash of a PIL image."""
     from PIL import Image
@@ -278,6 +367,7 @@ def strip_manualslib_watermark(pdf_path: Path | str) -> bool:
     Also removes marks left by the sites the manual passed through before:
     - Text stamps naming the site on every page (THIRD_PARTY_STAMP_RE)
     - Known full-page advert images at the front or back (JUNK_COVER_HASHES)
+    - Known logo/URL banner images drawn over pages (STAMP_IMAGE_HASHES)
 
     Args:
         pdf_path: Path to the PDF file
@@ -306,6 +396,7 @@ def strip_manualslib_watermark(pdf_path: Path | str) -> bool:
             modified = True
 
         stamped = _strip_third_party_stamps(pdf)
+        stamped += _strip_stamp_images(pdf)
         if stamped:
             modified = True
             logger.info(f"Removed third-party site stamps from {stamped} pages of {pdf_path}")
