@@ -5,6 +5,8 @@ import hashlib
 import logging
 import re
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import internetarchive as ia
@@ -240,12 +242,19 @@ def build_upload_metadata(manual: dict) -> dict:
     }
 
 
-def upload_manual_to_ia(manual: dict) -> str | None:
+# IA's S3 endpoint answers "503 SlowDown" when it is busy; the client retries
+# those after a pause instead of failing the upload.
+UPLOAD_RETRIES = 5
+UPLOAD_RETRIES_SLEEP = 30
+
+
+def upload_manual_to_ia(manual: dict, verbose: bool = True) -> str | None:
     """
     Upload a manual to Internet Archive.
 
     Args:
         manual: Database record dict with file_path, doc_description, brand, model, manualslib_id
+        verbose: Show the client's per-file progress bar (off when uploading in parallel)
 
     Returns:
         Archive.org URL if successful, None otherwise
@@ -289,7 +298,9 @@ def upload_manual_to_ia(manual: dict) -> str | None:
             identifier,
             files={remote_filename: file_path},
             metadata=metadata,
-            verbose=True,
+            verbose=verbose,
+            retries=UPLOAD_RETRIES,
+            retries_sleep=UPLOAD_RETRIES_SLEEP,
         )
 
         # Check result
@@ -352,6 +363,7 @@ def get_uploadable_manuals(source: str = None, limit: int = None) -> list[dict]:
 def upload_all_pending(
     source: str = None,
     limit: int = None,
+    workers: int = 1,
 ) -> tuple[int, int]:
     """
     Upload all pending manuals to Internet Archive.
@@ -359,6 +371,9 @@ def upload_all_pending(
     Args:
         source: Filter by source
         limit: Maximum number to upload
+        workers: Number of uploads to run at once. A single upload stream to
+            IA is usually far below the line speed, so a few in parallel
+            finish the queue several times faster.
 
     Returns:
         Tuple of (successful_count, failed_count)
@@ -368,21 +383,48 @@ def upload_all_pending(
         logger.info(f"Marked {archived} manuals as archived (same document as an already-archived manual)")
 
     manuals = get_uploadable_manuals(source=source, limit=limit)
-    logger.info(f"Found {len(manuals)} manuals to upload")
+    total = len(manuals)
+    workers = max(1, workers)
+    logger.info(f"Found {total} manuals to upload" + (f" ({workers} at a time)" if workers > 1 else ""))
 
     success = 0
     failed = 0
+    lock = threading.Lock()
 
-    for manual in manuals:
-        archive_url = upload_manual_to_ia(manual)
+    def upload_one(manual: dict) -> bool:
+        # get_uploadable_manuals yields one manual per IA identifier, so no
+        # two workers ever upload to the same item
+        archive_url = upload_manual_to_ia(manual, verbose=workers == 1)
+        if not archive_url:
+            return False
+        siblings = database.update_archived(manual["id"], archive_url)
+        if siblings:
+            logger.info(f"  Also marked {siblings} other model(s) covered by this document as archived")
+        return True
 
-        if archive_url:
-            siblings = database.update_archived(manual["id"], archive_url)
-            if siblings:
-                logger.info(f"  Also marked {siblings} other model(s) covered by this document as archived")
-            success += 1
-        else:
-            failed += 1
+    if workers == 1:
+        for manual in manuals:
+            if upload_one(manual):
+                success += 1
+            else:
+                failed += 1
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(upload_one, m): m for m in manuals}
+            for future in as_completed(futures):
+                try:
+                    ok = future.result()
+                except Exception as e:
+                    logger.error(f"Upload error for manual {futures[future]['id']}: {e}")
+                    ok = False
+                with lock:
+                    if ok:
+                        success += 1
+                    else:
+                        failed += 1
+                    done = success + failed
+                if done % 25 == 0 or done == total:
+                    logger.info(f"Progress: {done}/{total} (success {success}, failed {failed})")
 
     logger.info(f"Upload complete. Success: {success}, Failed: {failed}")
     return success, failed
@@ -420,6 +462,7 @@ def main():
     parser.add_argument("--source", default=None, help="Source to upload from (default: all sources)")
     parser.add_argument("--limit", type=int, help="Max number to upload")
     parser.add_argument("--dry-run", action="store_true", help="Show detailed preview of what would be uploaded")
+    parser.add_argument("--workers", type=int, default=1, help="Uploads to run in parallel (default 1)")
     args = parser.parse_args()
 
     database.init_db()
@@ -433,6 +476,7 @@ def main():
         success, failed = upload_all_pending(
             source=args.source,
             limit=args.limit,
+            workers=args.workers,
         )
         print(f"Done. Success: {success}, Failed: {failed}")
 

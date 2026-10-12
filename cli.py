@@ -167,11 +167,13 @@ def scrape_elektrotanya(query, kategoria, index_only, download_only, limit, clea
               help="Source to upload from (default: all sources)")
 @click.option("--limit", type=int, help="Limit number of uploads")
 @click.option("--dry-run", is_flag=True, help="Preview uploads without uploading")
-def upload(source, limit, dry_run):
+@click.option("--workers", "-j", type=int, default=1, show_default=True,
+              help="Uploads to run in parallel (4-8 is a good range)")
+def upload(source, limit, dry_run, workers):
     """Upload downloaded manuals to Internet Archive."""
     import sys
 
-    argv = []
+    argv = ["--workers", str(workers)]
     if source:
         argv.extend(["--source", source])
     if limit:

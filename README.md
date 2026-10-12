@@ -162,6 +162,9 @@ uv run salli upload --source manualsbase --dry-run
 # Upload all pending manuals from a source
 uv run salli upload --source manualsbase
 uv run salli upload --source manualslib
+
+# Several uploads at once (a single stream to IA is slow; 4-8 is a good range)
+uv run salli upload --workers 6
 uv run salli upload --source manualzz
 
 # Limit number of uploads
