@@ -22,7 +22,7 @@ from pdf_utils import strip_manualslib_watermark
 load_dotenv()
 
 import database
-from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user, wait_for_cloudflare, get_proxy_url
+from browser_helper import launch_browser_with_extension, get_extension_path, setup_route_ad_blocking, apply_stealth, setup_bandwidth_saving, proxy_supports_rotation, resolve_proxy_user, wait_for_cloudflare, get_proxy_url, describe_proxy
 from captcha_solver import TwoCaptchaSolver, extract_sitekey_from_page, inject_captcha_response
 from local_captcha import LocalSolver, ImageChallengeSolver, WhisperTranscriber
 
@@ -1077,13 +1077,7 @@ def main():
 
     # Log proxy configuration (proxy is only used for browser, not file downloads)
     if use_proxy:
-        proxy_url_env = os.environ.get("PROXY_URL")
-        if proxy_url_env:
-            parsed = urllib.parse.urlsplit(proxy_url_env)
-            host, port = parsed.hostname, parsed.port
-        else:
-            host = os.environ.get("PROXY_HOST")
-            port = os.environ.get("PROXY_PORT")
+        host, port = describe_proxy()
         if host and port:
             logger.info(f"Proxy configured for browser: {host}:{port}")
             logger.info("Note: File downloads use direct connection (no proxy) to save bandwidth")

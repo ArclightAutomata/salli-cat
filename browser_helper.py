@@ -28,6 +28,51 @@ logger = logging.getLogger(__name__)
 
 
 PROXY_SESSION_PLACEHOLDER = "{session}"
+# Static/ISP proxies give one fixed IP per port and ignore session IDs. A
+# {port} placeholder in PROXY_URL is replaced with a random port from
+# PROXY_PORTS (e.g. "10001-10999" or "10001,10002,10005") on every call, so
+# rotation picks a different IP instead.
+PROXY_PORT_PLACEHOLDER = "{port}"
+_last_proxy_port: str | None = None
+
+
+def _proxy_ports() -> list[str]:
+    ports = []
+    for part in os.environ.get("PROXY_PORTS", "").replace(" ", "").split(","):
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            ports.extend(str(p) for p in range(int(lo), int(hi) + 1))
+        elif part:
+            ports.append(part)
+    return ports
+
+
+def _resolved_proxy_url() -> str | None:
+    """PROXY_URL with a {port} placeholder filled in (a fresh port each call)."""
+    global _last_proxy_port
+    proxy_url = os.environ.get("PROXY_URL")
+    if not proxy_url or PROXY_PORT_PLACEHOLDER not in proxy_url:
+        return proxy_url
+    ports = _proxy_ports()
+    if not ports:
+        logger.warning("PROXY_URL has a {port} placeholder but PROXY_PORTS is empty - ignoring PROXY_URL")
+        return None
+    choices = [p for p in ports if p != _last_proxy_port] or ports
+    port = random.choice(choices)
+    _last_proxy_port = port
+    logger.info(f"Using proxy port: {port}")
+    return proxy_url.replace(PROXY_PORT_PLACEHOLDER, port)
+
+
+def describe_proxy() -> tuple[str | None, str | None]:
+    """(host, port) of the configured proxy for logging; port may be a range."""
+    proxy_url = os.environ.get("PROXY_URL")
+    if proxy_url:
+        ports = os.environ.get("PROXY_PORTS", "")
+        parsed = urllib.parse.urlsplit(proxy_url.replace(PROXY_PORT_PLACEHOLDER, "1"))
+        port = ports if PROXY_PORT_PLACEHOLDER in proxy_url else (str(parsed.port) if parsed.port else None)
+        return parsed.hostname, port
+    return os.environ.get("PROXY_HOST"), os.environ.get("PROXY_PORT")
 
 
 def new_proxy_session_id() -> str:
@@ -40,9 +85,11 @@ def proxy_supports_rotation() -> bool:
     True if the proxy config contains a {session} placeholder, meaning a browser
     relaunch will get a fresh session ID and therefore a new exit IP.
     """
+    proxy_url = os.environ.get("PROXY_URL", "")
     return (
-        PROXY_SESSION_PLACEHOLDER in os.environ.get("PROXY_URL", "")
+        PROXY_SESSION_PLACEHOLDER in proxy_url
         or PROXY_SESSION_PLACEHOLDER in os.environ.get("PROXY_USER", "")
+        or (PROXY_PORT_PLACEHOLDER in proxy_url and len(_proxy_ports()) > 1)
     )
 
 
@@ -68,7 +115,7 @@ def get_proxy_url() -> str | None:
     PROXY_URL takes precedence over the individual PROXY_* variables.
     A {session} placeholder in the username is replaced with a fresh session ID.
     """
-    proxy_url = os.environ.get("PROXY_URL")
+    proxy_url = _resolved_proxy_url()
     if proxy_url:
         parsed = urllib.parse.urlsplit(proxy_url)
         if parsed.username:
@@ -103,7 +150,7 @@ def get_proxy_config() -> dict | None:
 
     Returns a proxy dict for Playwright, or None if not configured.
     """
-    proxy_url = os.environ.get("PROXY_URL")
+    proxy_url = _resolved_proxy_url()
     if proxy_url:
         parsed = urllib.parse.urlsplit(proxy_url)
         if not parsed.hostname:
