@@ -2,6 +2,7 @@
 
 import logging
 import re
+import subprocess
 from pathlib import Path
 
 import pikepdf
@@ -441,3 +442,39 @@ def strip_manualslib_watermark(pdf_path: Path | str) -> bool:
         return False
 
     return modified
+
+
+def repair_pdf(src: Path | str, dst: Path | str) -> bool:
+    """
+    Rewrite a damaged PDF as a structurally valid one at dst.
+
+    Some PDFs as distributed have broken cross-reference tables or object
+    offsets that viewers silently recover from but the Internet Archive
+    rejects ("Syntax error detected in pdf data"). qpdf rebuilds the file
+    from the objects it can find - it recovers more pages from badly broken
+    files than opening them with pikepdf - and drops any encryption.
+
+    Returns True if dst was written.
+    """
+    # qpdf exits 3 when it succeeded but had to warn about the damage it fixed
+    result = subprocess.run(
+        ["qpdf", "--decrypt", "--deterministic-id", "--object-streams=preserve", str(src), str(dst)],
+        capture_output=True, text=True,
+    )
+    if result.returncode not in (0, 3) or not Path(dst).exists():
+        logger.error(f"qpdf could not repair {src}: {result.stderr.strip()[:300]}")
+        return False
+
+    # IA also rejects empty shells of optional features: an interactive form
+    # with no fields (a leftover Acrobat Distiller adds to plain documents)
+    # and a layer list with no layers. Neither holds anything, so drop them.
+    with pikepdf.open(dst, allow_overwriting_input=True) as pdf:
+        dropped = False
+        for key, required in (('/AcroForm', '/Fields'), ('/OCProperties', '/OCGs')):
+            entry = pdf.Root.get(key)
+            if entry is not None and not len(entry.get(required, [])):
+                del pdf.Root[key]
+                dropped = True
+        if dropped:
+            pdf.save(dst, deterministic_id=True)
+    return True

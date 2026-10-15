@@ -410,7 +410,11 @@ See [Uploading to Internet Archive](#uploading-to-internet-archive) in the Usage
 The uploader:
 - Creates source-specific identifiers (e.g., `manualsbase-id-12345`)
 - Includes checksums (MD5/SHA1) as external identifiers for deduplication
-- Skips items that already exist on archive.org
+- Skips items that already exist on archive.org - unless the item holds no file
+  (left behind by an upload IA refused), which it fills in
+- Repairs PDFs that IA rejects as damaged ("Syntax error detected in pdf data"):
+  qpdf rebuilds the file and empty form/layer dictionaries are dropped. The result
+  becomes the `repaired` variant; the damaged file stays as `original`
 - Updates the database with archive URLs after successful upload
 
 **Note**: Requires `internetarchive` library and IA credentials configured via `ia configure`.

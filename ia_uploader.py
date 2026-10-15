@@ -12,6 +12,7 @@ from pathlib import Path
 import internetarchive as ia
 
 import database
+from pdf_utils import repair_pdf
 
 
 def get_git_commit() -> str | None:
@@ -248,6 +249,49 @@ UPLOAD_RETRIES = 5
 UPLOAD_RETRIES_SLEEP = 30
 
 
+def has_content_file(item) -> bool:
+    """Whether an IA item holds an uploaded file, not just IA's own metadata files."""
+    return any(f.get("source") == "original" and f.get("format") != "Metadata" for f in item.files)
+
+
+def is_rejected_pdf(error: Exception) -> bool:
+    """Whether an upload failed because IA's PDF check refused the file."""
+    message = str(error)
+    return "Uploaded content is unacceptable" in message and "pdf" in message.lower()
+
+
+def repair_manual_file(file_path: str) -> bool:
+    """
+    Repair a damaged PDF and make the result the primary file of every manual
+    using it, as a `repaired` variant. The damaged file stays as whichever
+    variant it was (usually `original`), so its checksums are still recorded.
+    """
+    from manualslib_scraper import compute_checksums, get_sha1_storage_path
+
+    src = Path(file_path)
+    temp_path = src.with_suffix(".repair.tmp")
+    if not repair_pdf(src, temp_path):
+        return False
+    sha1, md5 = compute_checksums(temp_path)
+    # Files live at <download_dir>/ab/cd/<sha1>.pdf
+    new_path = get_sha1_storage_path(src.parents[2], sha1)
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path.replace(new_path)
+    size = new_path.stat().st_size
+
+    old_sha1, _ = compute_checksums(src)
+    conn = database.get_connection()
+    manual_ids = [r[0] for r in conn.execute("SELECT id FROM manuals WHERE file_sha1 = ?", (old_sha1,))]
+    conn.close()
+    for manual_id in manual_ids:
+        database.replace_primary_variant(manual_id, "repaired", str(new_path), sha1, md5, size)
+    # Re-repairing a repaired file leaves the earlier attempt unused
+    if src != new_path and not database.is_file_referenced(str(src)):
+        src.unlink()
+    logger.info(f"Repaired {src.name[:12]} -> {sha1[:8]} for {len(manual_ids)} manual(s)")
+    return True
+
+
 def upload_manual_to_ia(manual: dict, verbose: bool = True) -> str | None:
     """
     Upload a manual to Internet Archive.
@@ -288,23 +332,46 @@ def upload_manual_to_ia(manual: dict, verbose: bool = True) -> str | None:
         if item.item_metadata.get("error"):
             logger.error(f"Error looking up {identifier}: {item.item_metadata['error']}")
             return None
-        if item.exists:
-            logger.info(f"Item already exists: https://archive.org/details/{identifier}")
-            return f"https://archive.org/details/{identifier}"
+        existing = item.exists
+        if existing:
+            # A failed upload can leave an item with only IA's own metadata
+            # files - fill it in rather than counting it as archived
+            if has_content_file(item):
+                logger.info(f"Item already exists: https://archive.org/details/{identifier}")
+                return f"https://archive.org/details/{identifier}"
+            logger.warning(f"Item {identifier} exists but has no file - uploading it")
 
-        # Upload with custom remote filename
-        # files dict maps remote filename -> local path
-        result = ia.upload(
-            identifier,
-            files={remote_filename: file_path},
-            metadata=metadata,
-            verbose=verbose,
-            retries=UPLOAD_RETRIES,
-            retries_sleep=UPLOAD_RETRIES_SLEEP,
-        )
+        def upload(file_path, metadata):
+            # files dict maps remote filename -> local path
+            return ia.upload(
+                identifier,
+                files={remote_filename: file_path},
+                metadata=metadata,
+                verbose=verbose,
+                retries=UPLOAD_RETRIES,
+                retries_sleep=UPLOAD_RETRIES_SLEEP,
+            )
+
+        try:
+            result = upload(file_path, metadata)
+        except Exception as e:
+            if not is_rejected_pdf(e):
+                raise
+            # IA creates the item before checking the file, so it exists now
+            existing = True
+            logger.warning(f"Internet Archive rejected {Path(file_path).name} as a damaged PDF - repairing it")
+            if not repair_manual_file(file_path):
+                return None
+            upload_info = build_upload_metadata(manual)
+            file_path, metadata = upload_info["local_file"], upload_info["metadata"]
+            result = upload(file_path, metadata)
 
         # Check result
         if result and all(r.status_code == 200 for r in result):
+            if existing and metadata.get("external-identifier"):
+                # Metadata sent with a PUT into an existing item is ignored;
+                # the checksums on it may describe a file that never landed
+                ia.modify_metadata(identifier, {"external-identifier": metadata["external-identifier"]})
             archive_url = f"https://archive.org/details/{identifier}"
             logger.info(f"Upload successful: {archive_url}")
             return archive_url
