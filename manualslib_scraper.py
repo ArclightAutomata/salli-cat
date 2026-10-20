@@ -303,6 +303,36 @@ def is_tv_category(cat_name: str) -> bool:
     return False
 
 
+# The /brand/X.html index prints at most this many categories per brand (its
+# most popular ones), so a big appliance brand like GE shows 8 appliance
+# categories and hides its TV one. Rows that hit the cap get their full brand
+# page checked.
+INDEX_CATEGORY_CAP = 8
+
+
+def brand_page_tv_categories(page: Page, slug: str) -> tuple[list[str], list[str], list[str]]:
+    """Read every category on a brand's own page.
+
+    Returns (all category names, TV category names, TV category URLs).
+    """
+    navigate(page, f"{BASE_URL}/brand/{slug}/")
+    names, tv_names, tv_urls, seen = [], [], [], set()
+    for link in page.query_selector_all(f'a[href*="/brand/{slug}/"]'):
+        href = link.get_attribute("href") or ""
+        if not href.endswith(".html"):
+            continue
+        url = href if href.startswith("http") else BASE_URL + href
+        name = link.inner_text().strip()
+        if not name or url in seen:
+            continue
+        seen.add(url)
+        names.append(name)
+        if is_tv_category(name):
+            tv_names.append(name)
+            tv_urls.append(url)
+    return names, tv_names, tv_urls
+
+
 def discover_brands(page: Page) -> tuple[list[dict], set[str]]:
     """Discover all brands that have TV in their categories.
 
@@ -316,6 +346,7 @@ def discover_brands(page: Page) -> tuple[list[dict], set[str]]:
     brands = []
     seen_slugs = set()
     all_tv_related_categories = set()  # Track all categories with "tv" in name
+    truncated = []  # (name, slug, url) of rows whose category list hit INDEX_CATEGORY_CAP
 
     # First, get all the letter/number index links
     logger.info("Discovering brands with TV category...")
@@ -382,6 +413,9 @@ def discover_brands(page: Page) -> tuple[list[dict], set[str]]:
                         tv_categories.append(cat_name)
                         tv_category_urls.append(cat_url)
 
+                if not tv_categories and len(all_categories) >= INDEX_CATEGORY_CAP:
+                    truncated.append((brand_name, slug, brand_url))
+
                 if tv_categories:
                     seen_slugs.add(slug)
                     brand_info = {
@@ -420,6 +454,37 @@ def discover_brands(page: Page) -> tuple[list[dict], set[str]]:
                     current_url = None
             else:
                 current_url = None
+
+    # Brands already in the DB (from an earlier discovery) don't need their page checked
+    known = {b["slug"] for b in database.get_all_brands()}
+    truncated = [r for r in dict.fromkeys(truncated) if r[1] not in seen_slugs and r[1] not in known]
+    logger.info(f"Checking {len(truncated)} brand pages whose index row hit the {INDEX_CATEGORY_CAP}-category cap")
+    for i, (brand_name, slug, brand_url) in enumerate(truncated, 1):
+        try:
+            all_categories, tv_categories, tv_category_urls = brand_page_tv_categories(page, slug)
+        except PlaywrightError as e:
+            logger.warning(f"Could not read brand page for {slug}: {e}")
+            continue
+        random_delay(1, 2)
+        if i % 50 == 0:
+            logger.info(f"Checked {i}/{len(truncated)} capped brand pages")
+        for cat_name in all_categories:
+            if 'tv' in cat_name.lower():
+                all_tv_related_categories.add(cat_name)
+        if not tv_categories:
+            continue
+        seen_slugs.add(slug)
+        brand_info = {
+            "name": brand_name,
+            "slug": slug,
+            "brand_url": brand_url,
+            "tv_categories": ", ".join(tv_categories),
+            "tv_category_urls": ", ".join(tv_category_urls),
+            "all_categories": ", ".join(all_categories),
+        }
+        brands.append(brand_info)
+        if database.add_brand(**brand_info):
+            logger.info(f"Added TV brand from its brand page: {brand_name} ({slug}) - Categories: {', '.join(tv_categories)}")
 
     logger.info(f"Discovered {len(brands)} brands with TV category")
     return brands, all_tv_related_categories
