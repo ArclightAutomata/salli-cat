@@ -233,6 +233,19 @@ def check_archive(continuous, delay_min, delay_max, stats):
     main()
 
 
+@cli.command()
+@click.option("--workers", "-j", type=int, default=4, show_default=True, help="Metadata requests in parallel")
+@click.option("--limit", type=int, help="Check at most this many non-ours items")
+def provenance(workers, limit):
+    """Record who uploaded each archive.org item (ours vs. third-party, dark)."""
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    import database
+    from ia_provenance import backfill
+    database.init_db()
+    backfill(workers=workers, limit=limit)
+
+
 # =============================================================================
 # Status command
 # =============================================================================

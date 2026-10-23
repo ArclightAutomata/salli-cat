@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 
 import database
+import ia_provenance
 from ia_uploader import build_identifier
 
 logging.basicConfig(
@@ -116,6 +117,10 @@ def run_checker(
             if is_archived:
                 logger.info(f"  FOUND on archive.org: {archive_url}")
                 database.update_archive_checked(manual["id"], True, archive_url)
+                try:
+                    ia_provenance.record(archive_url)
+                except Exception as e:
+                    logger.warning(f"  Could not record provenance: {e} (salli provenance fills it later)")
                 total_found += 1
             else:
                 logger.debug(f"  Not on archive.org")

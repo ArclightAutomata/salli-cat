@@ -12,6 +12,7 @@ from pathlib import Path
 import internetarchive as ia
 
 import database
+import ia_provenance
 from pdf_utils import repair_pdf
 
 
@@ -465,6 +466,12 @@ def upload_all_pending(
         if not archive_url:
             return False
         siblings = database.update_archived(manual["id"], archive_url)
+        # The item may have existed already (ours or someone else's), so read
+        # its uploader rather than assuming this upload made it
+        try:
+            ia_provenance.record(archive_url)
+        except Exception as e:
+            logger.warning(f"Could not record provenance for {archive_url}: {e} (salli provenance fills it later)")
         if siblings:
             logger.info(f"  Also marked {siblings} other model(s) covered by this document as archived")
         return True

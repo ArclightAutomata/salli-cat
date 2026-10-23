@@ -28,8 +28,13 @@ def _sibling_key(alias: str) -> str:
 
 _DOWNLOAD_COLUMNS = (
     "file_path", "file_sha1", "file_md5", "file_size", "downloaded_at",
-    "original_filename", "original_file_sha1", "original_file_md5",
+    "original_filename", "original_file_sha1", "original_file_md5", "file_origin",
 )
+
+# Who put a manual's archive.org item there. Filled from the item's own
+# metadata (ia_provenance.py); NULL until checked. Dark items hide their
+# uploader, so for them only archive_dark is known.
+_PROVENANCE_COLUMNS = ("archive_uploader", "archived_by_us", "archive_added_at", "archive_dark")
 
 
 def init_db():
@@ -105,6 +110,14 @@ def init_db():
         ("unavailable", "INTEGER DEFAULT 0"),
         ("unavailable_reason", "TEXT"),
         ("unavailable_at", "TEXT"),
+        # Provenance (see _PROVENANCE_COLUMNS). file_origin: where our local copy
+        # came from - the source site, or "archive.org" for a file fetched back
+        # from an item already there.
+        ("archive_uploader", "TEXT"),
+        ("archived_by_us", "INTEGER"),
+        ("archive_added_at", "TEXT"),
+        ("archive_dark", "INTEGER"),
+        ("file_origin", "TEXT"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE manuals ADD COLUMN {col} {coltype}")
@@ -116,6 +129,7 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded ON manuals(downloaded)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_archived ON manuals(archived)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_source ON manuals(source)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_archive_url ON manuals(archive_url)")
     cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_manuals_sibling_key ON manuals(source, {SIBLING_KEY})")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_brands_slug ON brands(slug)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_brands_scraped ON brands(scraped)")
@@ -484,8 +498,13 @@ def update_downloaded(
     original_file_md5: str = None,
     original_file_path: str = None,
     original_file_size: int = None,
+    file_origin: str = None,
 ):
-    """Update downloaded status and add file variants."""
+    """Update downloaded status and add file variants.
+
+    file_origin defaults to the manual's source site; pass "archive.org" for a
+    file fetched back from an existing archive.org item.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     downloaded_at = datetime.now().isoformat()
@@ -494,10 +513,11 @@ def update_downloaded(
     cursor.execute("""
         UPDATE manuals
         SET downloaded = 1, unavailable = 0, file_path = ?, file_sha1 = ?, file_md5 = ?, file_size = ?,
-            downloaded_at = ?, original_filename = ?, original_file_sha1 = ?, original_file_md5 = ?
+            downloaded_at = ?, original_filename = ?, original_file_sha1 = ?, original_file_md5 = ?,
+            file_origin = COALESCE(?, source)
         WHERE id = ?
     """, (file_path, file_sha1, file_md5, file_size, downloaded_at, original_filename,
-          original_file_sha1, original_file_md5, manual_id))
+          original_file_sha1, original_file_md5, file_origin, manual_id))
 
     # Add file variants
     if file_sha1 and file_md5 and file_size:
@@ -539,30 +559,43 @@ def update_downloaded(
 
 
 def _mark_siblings_archived(cursor, manual_id: int, archive_url: str) -> int:
-    """Mark the not-yet-archived siblings of a manual as archived. Returns count."""
+    """Mark the not-yet-archived siblings of a manual as archived. Returns count.
+
+    Siblings share the manual's archive.org item, so they also take its provenance.
+    """
+    provenance = ", ".join(f"{col} = (SELECT {col} FROM manuals WHERE id = :id)" for col in _PROVENANCE_COLUMNS)
     cursor.execute(f"""
         UPDATE manuals
-        SET archived = 1, archive_url = ?
+        SET archived = 1, archive_url = :url, {provenance}
         WHERE archived = 0
-          AND id != ?
-          AND source = (SELECT source FROM manuals WHERE id = ?)
-          AND {SIBLING_KEY} = (SELECT {SIBLING_KEY} FROM manuals WHERE id = ?)
-    """, (archive_url, manual_id, manual_id, manual_id))
+          AND id != :id
+          AND source = (SELECT source FROM manuals WHERE id = :id)
+          AND {SIBLING_KEY} = (SELECT {SIBLING_KEY} FROM manuals WHERE id = :id)
+    """, {"url": archive_url, "id": manual_id})
     return cursor.rowcount
 
 
-def update_archived(manual_id: int, archive_url: str) -> int:
+def update_archived(manual_id: int, archive_url: str, uploader: str = None, added_at: str = None,
+                    by_us: bool = None) -> int:
     """
     Mark a manual - and its siblings, which live in the same Internet Archive
     item - as archived. Returns the number of siblings that were also marked.
+
+    Pass by_us=True (with uploader/added_at) for an item we just uploaded. For
+    an item merely found on archive.org leave them unset; ia_provenance.py
+    fills them from the item's metadata.
     """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE manuals
-        SET archived = 1, archive_url = ?
+        SET archived = 1, archive_url = ?,
+            archive_uploader = COALESCE(?, archive_uploader),
+            archive_added_at = COALESCE(?, archive_added_at),
+            archived_by_us = COALESCE(?, archived_by_us),
+            archive_dark = CASE WHEN ? IS NULL THEN archive_dark ELSE 0 END
         WHERE id = ?
-    """, (archive_url, manual_id))
+    """, (archive_url, uploader, added_at, None if by_us is None else int(by_us), by_us, manual_id))
     siblings = _mark_siblings_archived(cursor, manual_id, archive_url)
     conn.commit()
     conn.close()
@@ -651,7 +684,8 @@ def sync_sibling_manuals() -> tuple[int, int]:
     cursor.execute(f"""
         UPDATE manuals
         SET archived = 1,
-            archive_url = (SELECT s.archive_url {sibling} AND s.archived = 1 AND s.archive_url IS NOT NULL ORDER BY s.id LIMIT 1)
+            archive_url = (SELECT s.archive_url {sibling} AND s.archived = 1 AND s.archive_url IS NOT NULL ORDER BY s.id LIMIT 1),
+            {", ".join(f"{col} = (SELECT s.{col} {sibling} AND s.archived = 1 AND s.archive_url IS NOT NULL ORDER BY s.id LIMIT 1)" for col in _PROVENANCE_COLUMNS)}
         WHERE archived = 0
           AND EXISTS (SELECT 1 {sibling} AND s.archived = 1 AND s.archive_url IS NOT NULL)
     """)
@@ -672,6 +706,34 @@ def sync_sibling_manuals() -> tuple[int, int]:
     conn.commit()
     conn.close()
     return archived, downloaded
+
+
+def set_archive_provenance(archive_url: str, uploader: str | None, added_at: str | None,
+                           by_us: bool | None, dark: bool) -> int:
+    """Record who uploaded an archive.org item, on every row that points at it."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE manuals
+        SET archive_uploader = ?, archive_added_at = ?, archived_by_us = ?, archive_dark = ?
+        WHERE archive_url = ?
+    """, (uploader, added_at, None if by_us is None else int(by_us), int(dark), archive_url))
+    conn.commit()
+    n = cursor.rowcount
+    conn.close()
+    return n
+
+
+def get_archive_urls_missing_provenance() -> list[str]:
+    """archive.org items we point at whose uploader hasn't been checked yet."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT DISTINCT archive_url FROM manuals
+        WHERE archived = 1 AND archive_url IS NOT NULL AND archive_dark IS NULL
+        ORDER BY archive_url
+    """).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 def update_manualslib_id(manual_id: int, manualslib_id: str):
