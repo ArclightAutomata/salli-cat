@@ -186,7 +186,7 @@ def build_upload_metadata(manual: dict) -> dict:
 
     # Build metadata
     git_commit = get_git_commit()
-    scanner = "Salli Cat (https://github.com/arclight0/salli-cat)"
+    scanner = "Salli Cat (https://github.com/ArclightAutomata/salli-cat)"
     if git_commit:
         scanner += f" @ {git_commit}"
 
